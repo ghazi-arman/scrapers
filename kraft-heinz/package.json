@@ -1,0 +1,26 @@
+{
+    "name": "kraftheinz-scraper-runner",
+    "private": true,
+    "type": "module",
+  "scripts": {
+    "start": "npx tsx scrape.ts ./brands.config.json"
+  },
+    "dependencies": {
+      "@aws-sdk/client-s3": "^3.0.0",
+      "@aws-sdk/client-dynamodb": "^3.0.0",
+      "@aws-sdk/lib-dynamodb": "^3.0.0",
+      "@aws-sdk/client-ssm": "^3.0.0",
+      "axios": "^1.6.0",
+      "cheerio": "^1.0.0-rc.12",
+      "p-limit": "^4.0.0",
+      "playwright": "^1.42.0",
+      "uuid": "^9.0.0"
+    },
+    "devDependencies": {
+      "@types/node": "^20.0.0",
+      "@types/uuid": "^9.0.0",
+      "dotenv": "^16.0.0",
+      "tsx": "^4.19.0",
+      "typescript": "^5.5.4"
+    }
+  }
