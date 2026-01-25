@@ -1,13 +1,12 @@
 import axios from "axios";
 import * as cheerio from "cheerio";
 import pLimit from "p-limit";
-import fs from "fs/promises";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 import { v4 as uuidv4 } from "uuid";
-import crypto from "crypto";
+import type { ScraperProductOutput, ScraperNutritionData } from "../shared-types";
 
 const PRODUCTS_PAGE = "https://www.smuckers.com/products";
 
@@ -25,13 +24,32 @@ const API_BASE_URL = process.env.API_BASE_URL || "https://it7rdy3qbh.execute-api
 const API_KEYS_PARAMETER_NAME = process.env.API_KEYS_PARAMETER_NAME || "/tummi/api-keys";
 
 // Cache for service token
-let serviceTokenCache = null;
+let serviceTokenCache: string | null = null;
 
-function cleanText(s) {
+type ScrapedProduct = {
+  url: string;
+  name: string | null;
+  image: string | null;
+  ingredientsText: string | null;
+  nutrition: {
+    servingSize: string | null;
+    calories: number | null;
+    nutrients: { [key: string]: { label: string; amount: string; dailyValue: string | null } };
+  };
+  upc12: string | null;
+};
+
+type NutrientMapping = {
+  key: string;
+  label: string;
+  dbField: string;
+};
+
+function cleanText(s: string | null | undefined): string {
   return (s ?? "").replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
 }
 
-function absUrl(base, href) {
+function absUrl(base: string, href: string): string | null {
   try {
     return new URL(href, base).toString();
   } catch {
@@ -39,7 +57,7 @@ function absUrl(base, href) {
   }
 }
 
-async function fetchHtml(url) {
+async function fetchHtml(url: string): Promise<string> {
   const res = await axios.get(url, {
     headers: {
       "User-Agent":
@@ -55,63 +73,62 @@ async function fetchHtml(url) {
  * ✅ FIXED: Only keep *real* Smuckers product detail URLs.
  * This prevents junk like OneTrust from being scraped.
  */
-function extractSmuckersProductLinks(listingUrl, html) {
-    const $ = cheerio.load(html);
-    const out = new Set();
-  
-    $("a[href]").each((_, a) => {
-      const href = $(a).attr("href");
-      if (!href) return;
-  
-      const full = absUrl(listingUrl, href);
-      if (!full) return;
-  
-      let u;
-      try {
-        u = new URL(full);
-      } catch {
-        return;
-      }
-  
-      // ✅ Only Smuckers
-      if (u.hostname !== "www.smuckers.com") return;
-  
-      const path = u.pathname.replace(/\/+$/, "");
-      if (!path || path === "/") return;
-  
-      // ✅ Exclude obvious non-product areas
-      const bannedPrefixes = [
-        "/products",
-        "/recipes",
-        "/articles",
-        "/about",
-        "/faqs",
-        "/search",
-        "/where-to-buy",
-        "/privacy",
-        "/terms",
-      ];
-      if (bannedPrefixes.some((p) => path === p || path.startsWith(p + "/"))) return;
-  
-      // ✅ Exclude "View All ..." category links (these are usually category landing pages)
-      const linkText = cleanText($(a).text()).toLowerCase();
-      if (linkText.startsWith("view all")) return;
-  
-      // ✅ Heuristic: product detail pages are "deeper" than category pages.
-      // Examples on /products include /fruit-spreads/jam/strawberry-jam (3 segments),
-      // and /ice-cream-toppings/magic-shell/magic-shell-chocolate-topping (3 segments). :contentReference[oaicite:2]{index=2}
-      const segments = path.split("/").filter(Boolean);
-      if (segments.length < 3) return;
-  
-      out.add(u.toString());
-    });
-  
-    return [...out];
-  }
-  
+function extractSmuckersProductLinks(listingUrl: string, html: string): string[] {
+  const $ = cheerio.load(html);
+  const out = new Set<string>();
 
-function extractJsonLd($) {
-  const out = [];
+  $("a[href]").each((_, a) => {
+    const href = $(a).attr("href");
+    if (!href) return;
+
+    const full = absUrl(listingUrl, href);
+    if (!full) return;
+
+    let u: URL;
+    try {
+      u = new URL(full);
+    } catch {
+      return;
+    }
+
+    // ✅ Only Smuckers
+    if (u.hostname !== "www.smuckers.com") return;
+
+    const path = u.pathname.replace(/\/+$/, "");
+    if (!path || path === "/") return;
+
+    // ✅ Exclude obvious non-product areas
+    const bannedPrefixes = [
+      "/products",
+      "/recipes",
+      "/articles",
+      "/about",
+      "/faqs",
+      "/search",
+      "/where-to-buy",
+      "/privacy",
+      "/terms",
+    ];
+    if (bannedPrefixes.some((p) => path === p || path.startsWith(p + "/"))) return;
+
+    // ✅ Exclude "View All ..." category links (these are usually category landing pages)
+    const linkText = cleanText($(a).text()).toLowerCase();
+    if (linkText.startsWith("view all")) return;
+
+    // ✅ Heuristic: product detail pages are "deeper" than category pages.
+    // Examples on /products include /fruit-spreads/jam/strawberry-jam (3 segments),
+    // and /ice-cream-toppings/magic-shell/magic-shell-chocolate-topping (3 segments).
+    const segments = path.split("/").filter(Boolean);
+    if (segments.length < 3) return;
+
+    out.add(u.toString());
+  });
+
+  return Array.from(out);
+}
+
+function extractJsonLd($: cheerio.CheerioAPI): any[] {
+  const out: any[] = [];
   $('script[type="application/ld+json"]').each((_, el) => {
     const raw = $(el).text();
     if (!raw) return;
@@ -126,14 +143,18 @@ function extractJsonLd($) {
   return out;
 }
 
-function extractOgImage($, pageUrl) {
+function extractOgImage($: cheerio.CheerioAPI, pageUrl: string): string | null {
   const og = $('meta[property="og:image"]').attr("content");
   const tw = $('meta[name="twitter:image"]').attr("content");
   const raw = og || tw || null;
   return raw ? absUrl(pageUrl, raw) : null;
 }
 
-function extractNutritionFromText(fullText) {
+function extractNutritionFromText(fullText: string): {
+  servingSize: string | null;
+  calories: number | null;
+  nutrients: { [key: string]: { label: string; amount: string; dailyValue: string | null } };
+} {
   // Normalize whitespace
   const t = cleanText(fullText);
 
@@ -142,15 +163,14 @@ function extractNutritionFromText(fullText) {
   const nutritionOnly = stopIdx >= 0 ? t.slice(0, stopIdx) : t;
 
   // Serving size: capture from "Serving Size" up to "Amount Per Serving" or "Calories"
-  let servingSize = null;
+  let servingSize: string | null = null;
   {
-    const m =
-      nutritionOnly.match(/Serving Size\s*(.+?)(?:Amount Per Serving|Calories)\b/i);
+    const m = nutritionOnly.match(/Serving Size\s*(.+?)(?:Amount Per Serving|Calories)\b/i);
     if (m) servingSize = cleanText(m[1]);
   }
 
   // Calories: capture number after "Calories"
-  let calories = null;
+  let calories: number | null = null;
   {
     const m = nutritionOnly.match(/\bCalories\s*(\d+)\b/i);
     if (m) calories = Number(m[1]);
@@ -158,7 +178,7 @@ function extractNutritionFromText(fullText) {
 
   // Nutrients: parse common FDA-style labels.
   // We'll look for patterns like "Total Fat 0g 0%" or "Protein 0g" etc.
-  const nutrients = {};
+  const nutrients: { [key: string]: { label: string; amount: string; dailyValue: string | null } } = {};
 
   const NUTRIENTS = [
     { key: "total_fat", label: "Total Fat" },
@@ -174,7 +194,7 @@ function extractNutritionFromText(fullText) {
     { key: "vitamin_d", label: "Vitamin D" },
     { key: "calcium", label: "Calcium" },
     { key: "iron", label: "Iron" },
-    { key: "potassium", label: "Potassium" }
+    { key: "potassium", label: "Potassium" },
   ];
 
   // Helper regex for amount like "0g", "10g", "0mg", "0µg"
@@ -211,15 +231,14 @@ function extractNutritionFromText(fullText) {
   return { servingSize, calories, nutrients };
 }
 
-
-function extractNutritionAndIngredients(url, html) {
+function extractNutritionAndIngredients(url: string, html: string): ScrapedProduct {
   const $ = cheerio.load(html);
 
   const name = cleanText($("h1").first().text()) || null;
   const image = extractOgImage($, url);
 
   // Ingredients: find exact "Ingredients" label and take next nearby text block.
-  let ingredientsText = null;
+  let ingredientsText: string | null = null;
   const ingredientsLabel = $("*")
     .filter((_, el) => cleanText($(el).text()) === "Ingredients")
     .first();
@@ -238,31 +257,31 @@ function extractNutritionAndIngredients(url, html) {
   }
 
   // Nutrition: get a text blob from the nutrition section or fallback to body text
-let nutritionText = "";
-const nutritionHeader = $("*")
-  .filter((_, el) => cleanText($(el).text()) === "Nutrition Information")
-  .first();
+  let nutritionText = "";
+  const nutritionHeader = $("*")
+    .filter((_, el) => cleanText($(el).text()) === "Nutrition Information")
+    .first();
 
-if (nutritionHeader.length) {
-  let cursor = nutritionHeader;
-  for (let i = 0; i < 60; i++) {
-    cursor = cursor.next();
-    if (!cursor || !cursor.length) break;
-    const chunk = cleanText(cursor.text());
-    if (chunk) nutritionText += chunk + " ";
-    if (/^Ingredients$/i.test(chunk)) break;
+  if (nutritionHeader.length) {
+    let cursor = nutritionHeader;
+    for (let i = 0; i < 60; i++) {
+      cursor = cursor.next();
+      if (!cursor || !cursor.length) break;
+      const chunk = cleanText(cursor.text());
+      if (chunk) nutritionText += chunk + " ";
+      if (/^Ingredients$/i.test(chunk)) break;
+    }
+  } else {
+    nutritionText = cleanText($("body").text());
   }
-} else {
-  nutritionText = cleanText($("body").text());
-}
 
-const parsedNutrition = extractNutritionFromText(nutritionText);
+  const parsedNutrition = extractNutritionFromText(nutritionText);
 
-const nutrition = {
-  servingSize: parsedNutrition.servingSize,
-  calories: parsedNutrition.calories,
-  nutrients: parsedNutrition.nutrients
-};
+  const nutrition = {
+    servingSize: parsedNutrition.servingSize,
+    calories: parsedNutrition.calories,
+    nutrients: parsedNutrition.nutrients,
+  };
 
   const servingMatch =
     nutritionText.match(/Serving Size\s*:? *([^\n]+)/i) ||
@@ -297,16 +316,16 @@ const nutrition = {
         "Calories",
       ]);
       if (!banned.has(label)) {
-        nutrition.nutrients[label] = { amount, dailyValue: dv };
+        nutrition.nutrients[label] = { label, amount, dailyValue: dv };
       }
     }
   }
 
   // UPC12 best-effort: JSON-LD gtin12, then HTML regex.
-  let upc12 = null;
+  let upc12: string | null = null;
   const jsonLd = extractJsonLd($);
 
-  const scanObj = (obj) => {
+  const scanObj = (obj: any): string | null => {
     if (!obj || typeof obj !== "object") return null;
     const cands = [obj.gtin12, obj.gtin, obj.sku, obj.productID, obj.mpn];
     for (const c of cands) {
@@ -341,20 +360,20 @@ const nutrition = {
   return { url, name, image, ingredientsText, nutrition, upc12 };
 }
 
-async function updateJobStatus(jobId, status, error = null) {
+async function updateJobStatus(jobId: string, status: string, error: string | null = null): Promise<void> {
   if (!SCRAPER_JOB_STATUS_TABLE_NAME) return;
 
   const now = new Date().toISOString();
-  const expressionAttributeNames = {
+  const expressionAttributeNames: { [key: string]: string } = {
     "#status": "status",
   };
-  const expressionAttributeValues = {
+  const expressionAttributeValues: { [key: string]: any } = {
     ":status": status,
     ":updated_at": now,
   };
-  
+
   let updateExpression = "SET #status = :status, updated_at = :updated_at";
-  
+
   if (error) {
     updateExpression += ", error = :error";
     expressionAttributeValues[":error"] = String(error);
@@ -372,7 +391,7 @@ async function updateJobStatus(jobId, status, error = null) {
   console.log(`Updated job ${jobId} status to ${status}`);
 }
 
-async function uploadToS3(results, jobId, runDateTime) {
+async function uploadToS3(results: ScraperProductOutput[], jobId: string, runDateTime: string): Promise<void> {
   if (!SCRAPER_OUTPUTS_BUCKET) {
     console.log("S3 bucket not configured, skipping upload");
     return;
@@ -396,27 +415,27 @@ async function uploadToS3(results, jobId, runDateTime) {
  * Parse serving size text to extract value and unit
  * Example: "1 Tbsp (20g)" -> { value: 1, unit: "Tbsp" }
  */
-function parseServingSize(servingSizeText) {
-  if (!servingSizeText || typeof servingSizeText !== 'string') {
+function parseServingSize(servingSizeText: string | null): { value: number | null; unit: string | null } {
+  if (!servingSizeText || typeof servingSizeText !== "string") {
     return { value: null, unit: null };
   }
 
   // Match pattern like "1 Tbsp (20g)" or "2 Tbsp" or "1 cup"
   // Look for number followed by unit (Tbsp, tsp, cup, etc.)
   const match = servingSizeText.match(/^(\d+(?:\.\d+)?)\s+(Tbsp|tbsp|TSP|tsp|cup|cups|oz|fl\s*oz|ml|g|kg|lb|lbs)\b/i);
-  
+
   if (match) {
     const value = parseFloat(match[1]);
     let unit = match[2];
-    
+
     // Normalize unit to standard form
-    if (unit.toLowerCase() === 'tbsp') unit = 'Tbsp';
-    else if (unit.toLowerCase() === 'tsp') unit = 'tsp';
-    else if (unit.toLowerCase() === 'cups') unit = 'cup';
-    else if (unit.toLowerCase() === 'lbs') unit = 'lb';
-    else if (unit.toLowerCase() === 'fl oz' || unit.toLowerCase() === 'floz') unit = 'fl oz';
+    if (unit.toLowerCase() === "tbsp") unit = "Tbsp";
+    else if (unit.toLowerCase() === "tsp") unit = "tsp";
+    else if (unit.toLowerCase() === "cups") unit = "cup";
+    else if (unit.toLowerCase() === "lbs") unit = "lb";
+    else if (unit.toLowerCase() === "fl oz" || unit.toLowerCase() === "floz") unit = "fl oz";
     else unit = unit.charAt(0).toUpperCase() + unit.slice(1).toLowerCase();
-    
+
     return { value, unit };
   }
 
@@ -424,9 +443,99 @@ function parseServingSize(servingSizeText) {
 }
 
 /**
+ * Parse nutrient amount string (e.g., "0g", "240mg") into numeric value
+ */
+function parseNutrientAmount(amount: string | null): number | null {
+  if (!amount || typeof amount !== "string") return null;
+
+  const cleaned = amount.trim();
+  const match = cleaned.match(/^(\d+(?:\.\d+)?)/);
+
+  if (match) {
+    const value = parseFloat(match[1]);
+    return isNaN(value) ? null : value;
+  }
+
+  return null;
+}
+
+/**
+ * Map nutrient key to database column name
+ */
+function mapNutrientKeyToColumn(key: string): string | null {
+  const mapping: { [key: string]: string } = {
+    total_fat: "total_fat_g",
+    saturated_fat: "saturated_fat_g",
+    trans_fat: "trans_fat_g",
+    cholesterol: "cholesterol_mg",
+    sodium: "sodium_mg",
+    total_carbohydrate: "total_carbs_g",
+    dietary_fiber: "fiber_g",
+    total_sugars: "sugars_g",
+    added_sugars: "added_sugars_g",
+    protein: "protein_g",
+    calcium: "calcium_mg",
+    iron: "iron_mg",
+    potassium: "potassium_mg",
+    vitamin_d: "vitamin_d_mcg",
+  };
+
+  return mapping[key] || null;
+}
+
+/**
+ * Transform scraped nutrition data to standard scraper format
+ */
+function transformNutritionToDbFormat(nutrition: ScrapedProduct["nutrition"]): ScraperNutritionData | null {
+  if (!nutrition) return null;
+
+  // Parse serving size
+  let servingSize = parseServingSize(nutrition.servingSize);
+
+  // If serving size parsing failed but we have nutrition data, use default
+  if (!servingSize.value || !servingSize.unit) {
+    const hasCalories = nutrition.calories !== null;
+    const hasNutrients = Object.keys(nutrition.nutrients).length > 0;
+
+    if (hasCalories || hasNutrients) {
+      console.log(`Warning: Could not parse serving size "${nutrition.servingSize}", using default 1 serving`);
+      servingSize = { value: 1, unit: "serving" };
+    } else {
+      // No nutrition data to save
+      return null;
+    }
+  }
+
+  // Build nutrition object with serving size
+  const result: any = {
+    serving_size_value: servingSize.value,
+    serving_size_unit_text: servingSize.unit,
+    serving_size_text: nutrition.servingSize || null,
+  };
+
+  if (nutrition.calories !== null && !isNaN(nutrition.calories)) {
+    result.calories = nutrition.calories;
+  }
+
+  // Map nutrients to database columns
+  for (const [key, nutrient] of Object.entries(nutrition.nutrients)) {
+    const columnName = mapNutrientKeyToColumn(key);
+    if (columnName) {
+      // Extract numeric value from amount string (e.g., "0g" -> 0, "240mg" -> 240)
+      const value = parseNutrientAmount(nutrient.amount);
+      if (value !== null) {
+        result[columnName] = value;
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
  * Get service token from SSM Parameter Store
  */
-async function getServiceToken() {
+async function getServiceToken(): Promise<string> {
   if (serviceTokenCache) {
     return serviceTokenCache;
   }
@@ -444,49 +553,52 @@ async function getServiceToken() {
 
     const parameter = JSON.parse(response.Parameter.Value);
     const token = parameter.InternalServiceToken;
-    
+
     if (!token) {
-      throw new Error('InternalServiceToken not found in parameter');
+      throw new Error("InternalServiceToken not found in parameter");
     }
 
     serviceTokenCache = token;
     return token;
   } catch (error) {
-    console.error('Error getting service token:', error);
+    console.error("Error getting service token:", error);
     throw error;
   }
 }
 
 /**
- * Transform scraped product to API request format
+ * Transform scraped product to standard scraper output format
  */
-function transformProductToApiRequest(product) {
+function transformProductToApiRequest(product: ScrapedProduct): ScraperProductOutput {
   const now = new Date().toISOString();
-  
+
   // Parse serving size from nutrition data
-  const servingSize = product.nutrition?.servingSize 
-    ? parseServingSize(product.nutrition.servingSize)
-    : { value: null, unit: null };
-  
+  const servingSize = product.nutrition?.servingSize ? parseServingSize(product.nutrition.servingSize) : { value: null, unit: null };
+
+  // Transform nutrition data to standard format
+  const nutrition = transformNutritionToDbFormat(product.nutrition);
+
   return {
-    product_name: product.name,
+    product_name: product.name || "",
     brand: "Smucker's",
-    upc: product.upc12 || "",
-    ingredients_text: product.ingredientsText,
-    serving_size_value: servingSize.value,
-    serving_size_unit: servingSize.unit,
+    upc: product.upc12 || undefined,
+    ingredients_text: product.ingredientsText || "",
+    serving_size_value: servingSize.value ?? undefined,
+    serving_size_unit: servingSize.unit ?? undefined,
+    serving_size_text: product.nutrition?.servingSize ?? undefined,
     source: SCRAPER_NAME,
     source_id: product.url,
     source_created_at: now,
     source_last_updated_at: now,
     image_url: product.image || undefined,
+    nutrition: nutrition || undefined,
   };
 }
 
 /**
  * Submit product for review via API
  */
-async function submitProductForReview(product) {
+async function submitProductForReview(product: ScrapedProduct): Promise<boolean> {
   if (!product.name || !product.ingredientsText) {
     console.log(`Skipping product ${product.name || product.url}: missing name or ingredients`);
     return false;
@@ -494,27 +606,25 @@ async function submitProductForReview(product) {
 
   try {
     const serviceToken = await getServiceToken();
-    const requestBody = transformProductToApiRequest(product);
+    const productOutput = transformProductToApiRequest(product);
+    // Remove scraper_job_id for API submission (it's only for S3)
+    const { scraper_job_id, ...requestBody } = productOutput;
 
-    const response = await axios.post(
-      `${API_BASE_URL}/submit-product-for-review`,
-      requestBody,
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Service-Token': serviceToken,
-        },
-      }
-    );
+    const response = await axios.post(`${API_BASE_URL}/submit-product-for-review`, requestBody, {
+      headers: {
+        "Content-Type": "application/json",
+        "X-Service-Token": serviceToken,
+      },
+    });
 
     if (response.status === 200) {
-      console.log(`✅ Submitted product "${product.name}" for review (job_id: ${response.data?.data?.job_id || 'N/A'})`);
+      console.log(`✅ Submitted product "${product.name}"` + (response.data?.data?.job_id ? ` for review (job_id: ${response.data.data.job_id})` : ""));
       return true;
     } else {
       console.error(`❌ Failed to submit product "${product.name}": HTTP ${response.status}`);
       return false;
     }
-  } catch (error) {
+  } catch (error: any) {
     if (error.response) {
       console.error(`❌ Failed to submit product "${product.name}": ${error.response.status} ${error.response.statusText} - ${JSON.stringify(error.response.data)}`);
     } else {
@@ -524,7 +634,7 @@ async function submitProductForReview(product) {
   }
 }
 
-async function main() {
+async function main(): Promise<void> {
   const jobId = uuidv4();
   const runDateTime = new Date().toISOString().replace(/[:.]/g, "-").slice(0, -5);
   const concurrency = Number(process.argv[2] || 5);
@@ -564,18 +674,17 @@ async function main() {
             const parsed = extractNutritionAndIngredients(u, html);
             console.log(`✅ ${parsed.name ?? "(no name)"} | ${u}`);
             return parsed;
-          } catch (e) {
-            console.error(`❌ Failed ${u}:`, e?.message || e);
-            return { url: u, error: String(e?.message || e) };
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            console.error(`❌ Failed ${u}:`, msg);
+            return { url: u, error: msg } as any;
           }
         })
       )
     );
 
     // Filter out errors and products without required fields
-    const validProducts = results.filter(
-      (r) => !r.error && r.name && r.ingredientsText
-    );
+    const validProducts = results.filter((r) => !(r as any).error && r.name && r.ingredientsText) as ScrapedProduct[];
 
     console.log(`Scraped ${validProducts.length} valid products out of ${results.length} total`);
 
@@ -601,7 +710,7 @@ async function main() {
         apiFailureCount++;
       }
     }
-    
+
     console.log(`\n📊 API Submission Summary: ${apiSuccessCount} submitted successfully, ${apiFailureCount} failed`);
 
     // Update job status
@@ -612,7 +721,7 @@ async function main() {
       await updateJobStatus(jobId, "complete");
       console.log(`Job ${jobId} completed successfully with ${validProducts.length} products`);
     }
-  } catch (error) {
+  } catch (error: any) {
     console.error("Fatal error:", error);
     await updateJobStatus(jobId, "failure", error?.message || String(error));
     process.exit(1);
