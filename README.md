@@ -46,9 +46,54 @@ This directory contains web scrapers for various brands.
 
 ### Running Locally
 
-The AWS SDK automatically uses the default credential chain, so you just need to:
-1. Configure AWS credentials (see Prerequisites above)
-2. Set the required environment variables
+You can run any scraper **locally** (no AWS/API) and optionally cap how many products are scraped with **`--limit N`**.
+
+**Local mode (`--local`):** Skips only DynamoDB (job status) and S3 (upload of products.json to the scraper-outputs bucket). API submission still runs—use your AWS profile so the scraper can read the service token from SSM and submit products for review.
+
+**Limit (`--limit N` or `-l N`):** Scrape at most N products. Discovery still runs fully; only the first N product URLs are detail-scraped. Useful for quick runs.
+
+**CLI options (all scrapers):**
+
+| Option | Description |
+|--------|-------------|
+| `--limit N` or `-l N` | Scrape at most N products (after discovery). |
+| `--local` | Skip DynamoDB job status and S3 upload; API submission still runs (use AWS profile for SSM). |
+
+**Target scraper options:**
+| Option | Description |
+|--------|-------------|
+| `--url <URL>` or `-u` | Scrape a single Target product URL. |
+| `--config <path>` or `-c` | Path to JSON config with `urls` array. |
+
+**Quick start (local + limit):**
+
+```bash
+# Kraft-Heinz: local run, limit 5 products
+cd scrapers/kraft-heinz && npm run scrape:local:limit
+
+# Kraft-Heinz: local run, custom limit (e.g. 10)
+cd scrapers/kraft-heinz && npm run scrape:local -- --limit 10
+
+# Smuckers: local run, limit 5 products
+cd scrapers/smuckers && npm run scrape:local:limit
+
+# Smuckers: local run, custom limit (e.g. 10)
+cd scrapers/smuckers && npm run scrape:local -- --limit 10
+
+# Target: scrape single product URL
+cd scrapers/target && npx tsx scrape.ts --url "https://www.target.com/p/ritz-herb-fresh-stacks-crackers-11-8oz/-/A-92270376" --local
+
+# Target: discover & scrape Good & Gather brand (from config.json), limit 5
+cd scrapers/target && npm run scrape:local:limit
+```
+
+**Full CLI (when not using npm scripts):**
+
+- **Kraft-Heinz:** `npx tsx scrape.ts ./brands.config.json [--limit N] [--local]`
+- **Smuckers:** `npx tsx scrape.ts [--concurrency N] [--limit N] [--local]` (default concurrency: 5)
+- **Target:** `npx tsx scrape.ts --url <URL>` or `npx tsx scrape.ts --config ./config.json [--limit N] [--local]` (config can include `brands` with `listingUrl` for discovery, e.g. Good & Gather)
+
+For full runs (with AWS and API), the AWS SDK uses the default credential chain. Configure AWS credentials and set the required environment variables (see Prerequisites above).
 
 #### Option 1: Using dotenv (Recommended for local development)
 
@@ -70,20 +115,33 @@ JOB_NAME=kraft-heinz
 
 Run with dotenv-cli:
 ```bash
+# Full run (requires AWS + API)
 npx dotenv -e .env -- npx tsx scrape.ts ./brands.config.json
+
+# Local only: scrape 5 products, no AWS/API (kraft-heinz)
+npx dotenv -e .env -- npx tsx scrape.ts ./brands.config.json --local --limit 5
+
+# Smuckers: local, limit 3 (no config path)
+npx tsx scrape.ts --local --limit 3
 ```
 
-Or add a script to `package.json`:
+Or use the built-in scripts (no dotenv needed for local-only runs):
+
+- **Kraft-Heinz:** `npm run scrape:local` or `npm run scrape:local:limit` (limit 5), or `npm run scrape:local -- --limit 10`
+- **Smuckers:** `npm run scrape:local` or `npm run scrape:local:limit` (limit 5), or `npm run scrape:local -- --limit 10`
+
+With dotenv for env-backed runs, you can add to `package.json`:
 ```json
 {
   "scripts": {
     "start": "npx tsx scrape.ts ./brands.config.json",
-    "start:local": "dotenv -e .env -- npx tsx scrape.ts ./brands.config.json"
+    "start:local": "dotenv -e .env -- npx tsx scrape.ts ./brands.config.json --local",
+    "start:local:limit": "dotenv -e .env -- npx tsx scrape.ts ./brands.config.json --local --limit 5"
   }
 }
 ```
 
-Then run: `npm run start:local`
+Then run: `npm run start:local` or `npm run start:local:limit`
 
 #### Option 2: Export Environment Variables
 
@@ -112,12 +170,19 @@ To find the actual values for your environment variables, check:
 4. **API Base URL**: Your API Gateway endpoint (check CDK outputs or API Gateway console)
 5. **SSM Parameter**: `/tummi/api-keys` (default, or check Parameter Store console)
 
-### Optional: Skip AWS Operations for Testing
+### What `--local` skips
 
-If you just want to test scraping without AWS operations, you can:
+When you use `--local`, the scraper skips only:
+
+1. **DynamoDB** – Creating/updating the job record in the scraper job status table.
+2. **S3** – Uploading the run’s products JSON to the scraper-outputs bucket (`s3://{SCRAPER_OUTPUTS_BUCKET}/{SCRAPER_NAME}/{runDateTime}/products.json`).
+
+API submission to submit-product-for-review still runs locally; configure your AWS profile so the scraper can read the service token from SSM.
+
+If you don’t use `--local`, you can still leave some env vars unset:
 - Leave `SCRAPER_OUTPUTS_BUCKET` unset (S3 upload will be skipped)
 - Leave `SCRAPER_JOB_STATUS_TABLE_NAME` unset (DynamoDB updates will be skipped)
-- The scraper will still write to the local JSONL file specified in `brands.config.json`
+- The scraper will still attempt API submission if `API_BASE_URL` and API keys are configured
 
 ### Troubleshooting
 

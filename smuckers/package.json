@@ -5,6 +5,8 @@
     "type": "module",
     "scripts": {
       "scrape": "npx tsx scrape.ts",
+      "scrape:local": "npx tsx scrape.ts --local",
+      "scrape:local:limit": "npx tsx scrape.ts --local --limit 5",
       "postinstall": "playwright install"
     },
   "dependencies": {

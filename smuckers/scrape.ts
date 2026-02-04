@@ -391,6 +391,11 @@ async function updateJobStatus(jobId: string, status: string, error: string | nu
   console.log(`Updated job ${jobId} status to ${status}`);
 }
 
+/**
+ * Upload results to S3 (skipped when running with --local).
+ * S3 operation: PutObject of products.json to scraper-outputs bucket at
+ * s3://{SCRAPER_OUTPUTS_BUCKET}/{SCRAPER_NAME}/{runDateTime}/products.json
+ */
 async function uploadToS3(results: ScraperProductOutput[], jobId: string, runDateTime: string): Promise<void> {
   if (!SCRAPER_OUTPUTS_BUCKET) {
     console.log("S3 bucket not configured, skipping upload");
@@ -634,13 +639,44 @@ async function submitProductForReview(product: ScrapedProduct): Promise<boolean>
   }
 }
 
+/** Parse CLI args: --concurrency N, --limit N, --local */
+function parseSmuckersArgs(): { concurrency: number; limit?: number; local: boolean } {
+  const argv = process.argv.slice(2);
+  let concurrency = 5;
+  let limit: number | undefined;
+  let local = false;
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--concurrency" && argv[i + 1] != null) {
+      const n = parseInt(argv[i + 1], 10);
+      if (!isNaN(n) && n > 0) concurrency = n;
+      i++;
+    } else if (argv[i] === "--limit" || argv[i] === "-l") {
+      const n = parseInt(argv[i + 1], 10);
+      if (!isNaN(n) && n > 0) {
+        limit = n;
+        i++;
+      }
+    } else if (argv[i] === "--local") {
+      local = true;
+    }
+  }
+  return { concurrency, limit, local };
+}
+
 async function main(): Promise<void> {
+  const { concurrency, limit: productLimit, local } = parseSmuckersArgs();
   const jobId = uuidv4();
   const runDateTime = new Date().toISOString().replace(/[:.]/g, "-").slice(0, -5);
-  const concurrency = Number(process.argv[2] || 5);
 
-  // Create job status entry
-  if (SCRAPER_JOB_STATUS_TABLE_NAME) {
+  if (local) {
+    console.log("Running in local mode: skipping DynamoDB job status and S3 upload; API submission still runs (use AWS profile for SSM).");
+  }
+  if (productLimit != null) {
+    console.log(`Limit: scraping at most ${productLimit} products.`);
+  }
+
+  // Create job status entry (skip when running locally)
+  if (!local && SCRAPER_JOB_STATUS_TABLE_NAME) {
     const putCommand = new PutCommand({
       TableName: SCRAPER_JOB_STATUS_TABLE_NAME,
       Item: {
@@ -664,11 +700,17 @@ async function main(): Promise<void> {
     console.log(`Found ${productLinks.length} Smuckers product links`);
     console.log("Sample:", productLinks.slice(0, 10));
 
-    const limit = pLimit(concurrency);
+    // Apply --limit: only scrape first N product URLs
+    const linksToScrape = productLimit != null ? productLinks.slice(0, productLimit) : productLinks;
+    if (productLimit != null && productLinks.length > productLimit) {
+      console.log(`[LIMIT] Scraping ${linksToScrape.length} of ${productLinks.length} discovered URLs`);
+    }
+
+    const concurrencyLimit = pLimit(concurrency);
 
     const results = await Promise.all(
-      productLinks.map((u) =>
-        limit(async () => {
+      linksToScrape.map((u) =>
+        concurrencyLimit(async () => {
           try {
             const html = await fetchHtml(u);
             const parsed = extractNutritionAndIngredients(u, html);
@@ -695,10 +737,12 @@ async function main(): Promise<void> {
       return { ...apiRequest, scraper_job_id: jobId };
     });
 
-    // Upload transformed products to S3 (for reference/backup)
-    await uploadToS3(transformedProducts, jobId, runDateTime);
+    // Upload results to S3 (skip when running locally). S3: PutObject of products.json to scraper-outputs bucket.
+    if (!local) {
+      await uploadToS3(transformedProducts, jobId, runDateTime);
+    }
 
-    // Submit each valid product via API
+    // Submit each valid product via API (runs locally too; use AWS profile for SSM API key).
     console.log(`\n📤 Submitting products for review via API...`);
     let apiSuccessCount = 0;
     let apiFailureCount = 0;
@@ -713,17 +757,27 @@ async function main(): Promise<void> {
 
     console.log(`\n📊 API Submission Summary: ${apiSuccessCount} submitted successfully, ${apiFailureCount} failed`);
 
-    // Update job status
-    if (validProducts.length === 0) {
-      await updateJobStatus(jobId, "error", "No products were scraped");
-      process.exit(1);
+    // Update job status (skip when running locally)
+    if (!local) {
+      if (validProducts.length === 0) {
+        await updateJobStatus(jobId, "error", "No products were scraped");
+        process.exit(1);
+      } else {
+        await updateJobStatus(jobId, "complete");
+        console.log(`Job ${jobId} completed successfully with ${validProducts.length} products`);
+      }
     } else {
-      await updateJobStatus(jobId, "complete");
-      console.log(`Job ${jobId} completed successfully with ${validProducts.length} products`);
+      if (validProducts.length === 0) {
+        console.error("No products were scraped.");
+        process.exit(1);
+      }
+      console.log(`\n✅ Local run complete: ${validProducts.length} products scraped; API submissions ran (DynamoDB/S3 skipped).`);
     }
   } catch (error: any) {
     console.error("Fatal error:", error);
-    await updateJobStatus(jobId, "failure", error?.message || String(error));
+    if (!local) {
+      await updateJobStatus(jobId, "failure", error?.message || String(error));
+    }
     process.exit(1);
   }
 }

@@ -385,7 +385,9 @@ async function submitProductForReview(product: ScrapedProduct): Promise<boolean>
 }
 
 /**
- * Upload results to S3
+ * Upload results to S3 (skipped when running with --local).
+ * S3 operation: PutObject of products.json to scraper-outputs bucket at
+ * s3://{SCRAPER_OUTPUTS_BUCKET}/{SCRAPER_NAME}/{runDateTime}/products.json
  */
 async function uploadToS3(results: ScraperProductOutput[], jobId: string, runDateTime: string): Promise<void> {
   if (!SCRAPER_OUTPUTS_BUCKET) {
@@ -1359,10 +1361,34 @@ async function scrapeProductDetail(browser: Browser, brandCfg: BrandConfig, prod
   }
 }
 
+/** Parse CLI args: config path (required), --limit N, --local */
+function parseKraftHeinzArgs(): { configPath: string; limit?: number; local: boolean } {
+  const argv = process.argv.slice(2);
+  let configPath: string | undefined;
+  let limit: number | undefined;
+  let local = false;
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--limit" || argv[i] === "-l") {
+      const n = parseInt(argv[i + 1], 10);
+      if (!isNaN(n) && n > 0) {
+        limit = n;
+        i++;
+      }
+    } else if (argv[i] === "--local") {
+      local = true;
+    } else if (!argv[i].startsWith("-")) {
+      configPath = argv[i];
+    }
+  }
+  return { configPath: configPath!, limit, local };
+}
+
 async function main(): Promise<void> {
-  const configPath = process.argv[2];
+  const { configPath, limit: productLimit, local } = parseKraftHeinzArgs();
   if (!configPath) {
-    console.error("Usage: npx tsx scrape.ts ./brands.config.json");
+    console.error("Usage: npx tsx scrape.ts ./brands.config.json [--limit N] [--local]");
+    console.error("  --limit N   Scrape at most N products (default: no limit)");
+    console.error("  --local     Skip AWS (DynamoDB, S3) and API submission; run scraping only");
     process.exit(1);
   }
 
@@ -1372,11 +1398,18 @@ async function main(): Promise<void> {
     throw new Error("Invalid config: must include non-empty brands[]");
   }
 
+  if (local) {
+    console.log("Running in local mode: skipping DynamoDB job status and S3 upload; API submission still runs (use AWS profile for SSM).");
+  }
+  if (productLimit != null) {
+    console.log(`Limit: scraping at most ${productLimit} products.`);
+  }
+
   const jobId = uuidv4();
   const runDateTime = new Date().toISOString().replace(/[:.]/g, "-").slice(0, -5);
 
-  // Create job status entry
-  if (SCRAPER_JOB_STATUS_TABLE_NAME) {
+  // Create job status entry (skip when running locally)
+  if (!local && SCRAPER_JOB_STATUS_TABLE_NAME) {
     const putCommand = new PutCommand({
       TableName: SCRAPER_JOB_STATUS_TABLE_NAME,
       Item: {
@@ -1426,18 +1459,28 @@ async function main(): Promise<void> {
     const allTargets: Array<{ brandCfg: BrandConfig; url: string }> = [];
 
     for (const brandCfg of cfg.brands) {
+      if (productLimit != null && allTargets.length >= productLimit) break;
       console.log(`\n[DISCOVER] ${brandCfg.brand}: ${brandCfg.listingUrl}`);
       const urls = await scrapeListing(browser, brandCfg);
       console.log(`[DISCOVER] ${brandCfg.brand}: ${urls.length} product URLs`);
-      for (const url of urls) allTargets.push({ brandCfg, url });
+      for (const url of urls) {
+        allTargets.push({ brandCfg, url });
+        if (productLimit != null && allTargets.length >= productLimit) break;
+      }
+    }
+
+    // Apply --limit: only scrape first N product URLs
+    const targets = productLimit != null ? allTargets.slice(0, productLimit) : allTargets;
+    if (productLimit != null && allTargets.length > productLimit) {
+      console.log(`[LIMIT] Scraping ${targets.length} of ${allTargets.length} discovered URLs`);
     }
 
     // 2) Scrape details with bounded concurrency
-    const limit = pLimit(Math.max(1, cfg.concurrency ?? 4));
+    const concurrencyLimit = pLimit(Math.max(1, cfg.concurrency ?? 4));
 
     const results = await Promise.all(
-      allTargets.map(({ brandCfg, url }) =>
-        limit(async () => {
+      targets.map(({ brandCfg, url }) =>
+        concurrencyLimit(async () => {
           try {
             const product = await scrapeProductDetail(browser, brandCfg, url);
             console.log(`[OK] ${brandCfg.brand} ${product.upc12 ?? ""} ${product.name ?? ""}`.trim());
@@ -1465,13 +1508,15 @@ async function main(): Promise<void> {
       return { ...apiRequest, scraper_job_id: jobId };
     });
 
-    // Upload transformed products to S3 (for reference/backup)
-    await uploadToS3(transformedProducts, jobId, runDateTime);
+    // Upload results to S3 (skip when running locally). S3: PutObject of products.json to scraper-outputs bucket.
+    if (!local) {
+      await uploadToS3(transformedProducts, jobId, runDateTime);
+    }
 
-    // Submit each valid product via API (with concurrency limit)
+    // Submit each valid product via API (runs locally too; use AWS profile for SSM API key).
     console.log(`\n📤 Submitting products for review via API...`);
     const apiLimit = pLimit(10); // Submit 10 products concurrently to avoid overwhelming the API
-    
+
     const apiResults = await Promise.all(
       validProducts.map((product) =>
         apiLimit(async () => {
@@ -1480,23 +1525,33 @@ async function main(): Promise<void> {
         })
       )
     );
-    
+
     const apiSuccessCount = apiResults.filter((r) => r === true).length;
     const apiFailureCount = apiResults.filter((r) => r === false).length;
-    
+
     console.log(`\n📊 API Submission Summary: ${apiSuccessCount} submitted successfully, ${apiFailureCount} failed`);
 
-    // Update job status
-    if (validProducts.length === 0) {
-      await updateJobStatus(jobId, "error", "No products were scraped");
-      process.exit(1);
+    // Update job status (skip when running locally)
+    if (!local) {
+      if (validProducts.length === 0) {
+        await updateJobStatus(jobId, "error", "No products were scraped");
+        process.exit(1);
+      } else {
+        await updateJobStatus(jobId, "complete");
+        console.log(`Job ${jobId} completed successfully with ${validProducts.length} products`);
+      }
     } else {
-      await updateJobStatus(jobId, "complete");
-      console.log(`Job ${jobId} completed successfully with ${validProducts.length} products`);
+      if (validProducts.length === 0) {
+        console.error("No products were scraped.");
+        process.exit(1);
+      }
+      console.log(`\n✅ Local run complete: ${validProducts.length} products scraped; API submissions ran (DynamoDB/S3 skipped).`);
     }
   } catch (error: any) {
     console.error("Fatal error:", error);
-    await updateJobStatus(jobId, "failure", error?.message || String(error));
+    if (!local) {
+      await updateJobStatus(jobId, "failure", error?.message || String(error));
+    }
     process.exit(1);
   } finally {
     await browser.close().catch(() => null);
