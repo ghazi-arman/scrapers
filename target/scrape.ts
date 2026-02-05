@@ -52,6 +52,8 @@ const SCRAPER_OUTPUTS_BUCKET = process.env.SCRAPER_OUTPUTS_BUCKET;
 const SCRAPER_JOB_STATUS_TABLE_NAME = process.env.SCRAPER_JOB_STATUS_TABLE_NAME;
 const API_BASE_URL = process.env.API_BASE_URL || "https://it7rdy3qbh.execute-api.us-west-2.amazonaws.com";
 const API_KEYS_PARAMETER_NAME = process.env.API_KEYS_PARAMETER_NAME || "/tummi/api-keys";
+const REDSKY_API_KEY = process.env.TARGET_REDSKY_API_KEY || "9f36aeafbe60771e321a7cc95a78140772ab3e96";
+const TARGET_STORE_ID = process.env.TARGET_STORE_ID || "305";
 
 const s3Client = new S3Client({});
 const dynamoDbClient = new DynamoDBClient({});
@@ -350,75 +352,116 @@ function extractFromRedskyPdp(data: unknown): {
   const product =
     (root.product as Record<string, unknown>) ??
     ((root.data as Record<string, unknown> | undefined)?.product as Record<string, unknown>) ??
+    ((root.data as Record<string, unknown> | undefined)?.data as Record<string, unknown> | undefined)
+      ?.product ??
+    findRedskyProductNode(root) ??
     null;
   const item = (product?.item as Record<string, unknown>) ?? null;
   const enrichment = (item?.enrichment as Record<string, unknown>) ?? null;
   if (!item || !enrichment) return result;
 
-  const productDesc = (item?.product_description as Record<string, unknown>) ?? null;
-  result.name = (productDesc?.title as string) || undefined;
+  const fillFromItem = (it: Record<string, unknown> | null | undefined): void => {
+    if (!it) return;
+    const productDesc = (it.product_description as Record<string, unknown>) ?? null;
+    if (!result.name && productDesc?.title) result.name = productDesc.title as string;
 
-  const imageInfo = (enrichment?.image_info as Record<string, unknown>) ?? null;
-  const primaryImage = (imageInfo?.primary_image as Record<string, string>) ?? null;
-  if (primaryImage?.url) {
-    result.imageUrl = primaryImage.url.startsWith("//") ? `https:${primaryImage.url}` : primaryImage.url;
-  }
+    const enrich = (it.enrichment as Record<string, unknown>) ?? null;
+    const imageInfo = (enrich?.image_info as Record<string, unknown>) ?? null;
+    const primaryImage = (imageInfo?.primary_image as Record<string, string>) ?? null;
+    if (!result.imageUrl && primaryImage?.url) {
+      result.imageUrl = primaryImage.url.startsWith("//") ? `https:${primaryImage.url}` : primaryImage.url;
+    }
 
-  const nutritionFacts = (enrichment?.nutrition_facts as Record<string, unknown>) ?? null;
-  if (nutritionFacts?.ingredients && typeof nutritionFacts.ingredients === "string") {
-    result.ingredients = normalizeWhitespace(nutritionFacts.ingredients);
-  }
+    const nutritionFacts = (enrich?.nutrition_facts as Record<string, unknown>) ?? null;
+    if (!result.ingredients && nutritionFacts?.ingredients && typeof nutritionFacts.ingredients === "string") {
+      result.ingredients = normalizeWhitespace(nutritionFacts.ingredients);
+    }
 
-  const lists =
-    (nutritionFacts?.value_prepared_list as any[]) ??
-    (nutritionFacts?.value_list as any[]) ??
-    (nutritionFacts?.value_unprepared_list as any[]) ??
-    (nutritionFacts?.nutrition_fact_list as any[]) ??
-    null;
+    if (!result.nutrition) {
+      const lists =
+        (nutritionFacts?.value_prepared_list as any[]) ??
+        (nutritionFacts?.value_list as any[]) ??
+        (nutritionFacts?.value_unprepared_list as any[]) ??
+        (nutritionFacts?.nutrition_fact_list as any[]) ??
+        null;
 
-  if (Array.isArray(lists) && lists.length > 0) {
-    const v: any = lists[0];
-    const servingSize =
-      v.serving_size && v.serving_size_unit_of_measurement
-        ? `${v.serving_size} ${v.serving_size_unit_of_measurement}`
-        : v.serving_size || v.servingSize || null;
-    const servingsPer = v.servings_per_container || v.servingsPerContainer || null;
+      if (Array.isArray(lists) && lists.length > 0) {
+        const v: any = lists[0];
+        const servingSize =
+          v.serving_size && v.serving_size_unit_of_measurement
+            ? `${v.serving_size} ${v.serving_size_unit_of_measurement}`
+            : v.serving_size || v.servingSize || null;
+        const servingsPer = v.servings_per_container || v.servingsPerContainer || null;
 
-    let calories: string | null = null;
-    const nutrients: NutritionNutrient[] = [];
+        let calories: string | null = null;
+        const nutrients: NutritionNutrient[] = [];
 
-    for (const n of v.nutrients || v.items || []) {
-      const nm = (n?.name ?? n?.label ?? "").toString();
-      const lower = nm.toLowerCase();
+        for (const n of v.nutrients || v.items || []) {
+          const nm = (n?.name ?? n?.label ?? "").toString();
+          const lower = nm.toLowerCase();
 
-      const qty = n?.quantity ?? n?.amount ?? n?.value ?? null;
-      const unit = n?.unit_of_measurement ?? n?.unit ?? "";
-      const pct = n?.percentage ?? n?.dailyValue ?? n?.daily_value ?? null;
+          const qty = n?.quantity ?? n?.amount ?? n?.value ?? null;
+          const unit = n?.unit_of_measurement ?? n?.unit ?? "";
+          const pct = n?.percentage ?? n?.dailyValue ?? n?.daily_value ?? null;
 
-      if (lower === "calories") {
-        if (qty != null) calories = String(qty);
-        continue;
-      }
+          if (lower === "calories") {
+            if (qty != null) calories = String(qty);
+            continue;
+          }
 
-      if (nm) {
-        nutrients.push({
-          name: nm,
-          amount: qty != null ? `${qty}${unit || ""}` : null,
-          dailyValuePercent: pct != null ? `${pct}%` : null,
-        });
+          if (nm) {
+            nutrients.push({
+              name: nm,
+              amount: qty != null ? `${qty}${unit || ""}` : null,
+              dailyValuePercent: pct != null ? `${pct}%` : null,
+            });
+          }
+        }
+
+        result.nutrition = { servingSize, servingsPerContainer: servingsPer, calories, nutrients };
       }
     }
 
-    result.nutrition = { servingSize, servingsPerContainer: servingsPer, calories, nutrients };
-  }
+    const primaryBarcode = it.primary_barcode as string | undefined;
+    if (!result.upc12 && primaryBarcode) {
+      const m = primaryBarcode.match(/(\d{12})/);
+      result.upc12 = m?.[1] ?? primaryBarcode;
+    }
+  };
 
-  const primaryBarcode = item?.primary_barcode as string | undefined;
-  if (primaryBarcode) {
-    const m = primaryBarcode.match(/(\d{12})/);
-    result.upc12 = m?.[1] ?? primaryBarcode;
+  fillFromItem(item);
+
+  const children = (product?.children as Array<Record<string, unknown>>) ?? [];
+  for (const child of children) {
+    const childItem = (child.item as Record<string, unknown>) ?? null;
+    fillFromItem(childItem);
+    if (result.ingredients && result.nutrition) break;
   }
 
   return result;
+}
+
+function findRedskyProductNode(obj: unknown): Record<string, unknown> | null {
+  if (!obj || typeof obj !== "object") return null;
+  const o = obj as Record<string, unknown>;
+
+  if (o.item && typeof o.item === "object") {
+    const item = o.item as Record<string, unknown>;
+    const enrichment = item.enrichment as Record<string, unknown> | undefined;
+    if (enrichment?.nutrition_facts || enrichment?.image_info || item.product_description) {
+      return o;
+    }
+  }
+
+  if (o.product && typeof o.product === "object") return o.product as Record<string, unknown>;
+
+  for (const v of Object.values(o)) {
+    if (v && typeof v === "object") {
+      const found = findRedskyProductNode(v);
+      if (found) return found;
+    }
+  }
+  return null;
 }
 
 function findRedskyUrl(html: string): string | null {
@@ -569,7 +612,7 @@ function parseUpcFromSpecifications($: cheerio.CheerioAPI): string | null {
 }
 
 async function ensurePdpExpanded(page: Page): Promise<void> {
-  await page.waitForTimeout(1200);
+  await page.waitForTimeout(600);
 
   await page
     .getByRole("button", { name: /accept|agree|close|got it|continue/i })
@@ -590,10 +633,10 @@ async function ensurePdpExpanded(page: Page): Promise<void> {
   // Scroll to trigger lazy content
   for (let i = 0; i < 4; i++) {
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await page.waitForTimeout(600);
+    await page.waitForTimeout(300);
   }
 
-  await page.waitForSelector("script#__NEXT_DATA__", { timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("script#__NEXT_DATA__", { timeout: 5000 }).catch(() => {});
 }
 
 function extractBrandFromName(name: string | null): string | null {
@@ -601,6 +644,66 @@ function extractBrandFromName(name: string | null): string | null {
   const parts = name.split(/\s+/);
   if (parts.length >= 2 && /^[A-Z][a-zA-Z0-9]+$/.test(parts[0])) return parts[0];
   return null;
+}
+
+function addImageParams(url: string | null): string | null {
+  if (!url) return null;
+  try {
+    const u = new URL(url);
+    u.searchParams.set("wid", "1200");
+    u.searchParams.set("hei", "1200");
+    u.searchParams.set("qlt", "80");
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
+function decodeHtmlEntities(input: string | null): string | null {
+  if (!input) return null;
+  return input
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&#(\d+);/g, (_, num) => {
+      const code = parseInt(num, 10);
+      return Number.isFinite(code) ? String.fromCharCode(code) : _;
+    })
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stripBrandSuffix(name: string | null): string | null {
+  if (!name) return null;
+  const cleaned = name.trim();
+  const re =
+    /\s*[-–—]?\s*(Good\s*&\s*Gather|Favorite\s*Day)(?:™|TM)?\s*$/i;
+  const next = cleaned.replace(re, "").trim();
+  return next || cleaned;
+}
+
+function parseTcinFromUrl(url: string): string | null {
+  const m = url.match(/\/A-(\d{8,})/);
+  return m?.[1] ?? null;
+}
+
+function buildRedskyPdpClientUrl(tcin: string): string {
+  const u = new URL("https://redsky.target.com/redsky_aggregations/v1/web/pdp_client_v1");
+  u.searchParams.set("key", REDSKY_API_KEY);
+  u.searchParams.set("tcin", tcin);
+  u.searchParams.set("is_bot", "false");
+  u.searchParams.set("store_id", TARGET_STORE_ID);
+  u.searchParams.set("pricing_store_id", TARGET_STORE_ID);
+  u.searchParams.set("has_pricing_store_id", "true");
+  u.searchParams.set("include_obsolete", "true");
+  u.searchParams.set("skip_personalized", "true");
+  u.searchParams.set("skip_variation_hierarchy", "true");
+  u.searchParams.set("channel", "WEB");
+  u.searchParams.set("page", `/p/A-${tcin}`);
+  return u.toString();
 }
 
 function stripWeightBrandSuffix(name: string | null): string | null {
@@ -618,6 +721,13 @@ function stripWeightBrandSuffix(name: string | null): string | null {
 
   const head = clean.slice(0, match.index).trim();
   return head || clean;
+}
+
+function normalizeProductName(name: string | null): string | null {
+  if (!name) return null;
+  const decoded = decodeHtmlEntities(name);
+  const stripped = stripWeightBrandSuffix(decoded);
+  return stripBrandSuffix(stripped);
 }
 
 function hasIngredientsOrNutrition(p: ScrapedProduct): boolean {
@@ -652,6 +762,51 @@ async function scrapeProductDetail(
 ): Promise<ScrapedProduct> {
   const page = await context.newPage();
   try {
+    const tcin = parseTcinFromUrl(productUrl);
+    let apiResult: ExtractResult | null = null;
+    if (tcin) {
+      const apiUrl = buildRedskyPdpClientUrl(tcin);
+      if (DEBUG_PDP) console.log(`[DEBUG] api-first: fetching ${apiUrl}`);
+      try {
+        const resp = await page.request.get(apiUrl, { headers: { accept: "application/json" } });
+        if (resp.ok()) {
+          const data = await resp.json();
+          apiResult = extractFromRedskyPdp(data);
+          if (DEBUG_PDP) {
+            console.log(
+              `[DEBUG] api-first: extracted name=${apiResult?.name ? "yes" : "no"} ` +
+                `ingredients=${apiResult?.ingredients ? "yes" : "no"} ` +
+                `nutrition=${apiResult?.nutrition ? "yes" : "no"}`
+            );
+          }
+        } else if (DEBUG_PDP) {
+          console.log(`[DEBUG] redsky api status ${resp.status()} for ${apiUrl}`);
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    if (apiResult?.name && (apiResult.ingredients || apiResult.nutrition)) {
+      if (DEBUG_PDP) console.log("[DEBUG] api-first: using redsky result, skipping DOM");
+      const now = new Date().toISOString();
+      return {
+        brand: brandOverride || extractBrandFromName(apiResult.name) || "Unknown",
+        source: SOURCE,
+        productUrl,
+        name: normalizeProductName(apiResult.name),
+        ingredients: apiResult.ingredients ?? null,
+        upc12: apiResult.upc12 ?? null,
+        nutrition: apiResult.nutrition ?? null,
+        imageUrl: addImageParams(apiResult.imageUrl ?? null),
+        scrapedAt: now,
+        sourceCreatedAt: null,
+        sourceLastUpdatedAt: null,
+      };
+    }
+
+    if (DEBUG_PDP) console.log("[DEBUG] api-first: falling back to DOM/response capture");
+
     const redskyPayloads: Array<{ url: string; data: unknown }> = [];
     let redskyDumped = false;
 
@@ -665,23 +820,14 @@ async function scrapeProductDetail(
         }
         const data = await resp.json();
         redskyPayloads.push({ url, data });
-        if (DEBUG_PDP && !redskyDumped) {
-          redskyDumped = true;
-          try {
-            fs.writeFileSync("/tmp/target-redsky.json", JSON.stringify({ url, data }, null, 2));
-            console.log("[DEBUG] wrote /tmp/target-redsky.json");
-          } catch {
-            // ignore
-          }
-        }
       } catch {
         // ignore
       }
     });
 
     await page.goto(productUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await page.waitForTimeout(1500);
-    await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(800);
+    await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
 
     await ensurePdpExpanded(page);
 
@@ -703,9 +849,17 @@ async function scrapeProductDetail(
 
     const fromPreloaded = extractFromPreloadedQueries(html);
     const fromNext = extractFromNextData(html);
-    let fromRedsky: ExtractResult = {};
+    let fromRedsky: ExtractResult = apiResult ?? {};
 
-    for (const payload of redskyPayloads) {
+    const orderedPayloads = [...redskyPayloads].sort((a, b) => {
+      const aScore =
+        /pdp_client_v1/i.test(a.url) ? 3 : /pdp_server_v1/i.test(a.url) ? 2 : /pdp_/i.test(a.url) ? 1 : 0;
+      const bScore =
+        /pdp_client_v1/i.test(b.url) ? 3 : /pdp_server_v1/i.test(b.url) ? 2 : /pdp_/i.test(b.url) ? 1 : 0;
+      return bScore - aScore;
+    });
+
+    for (const payload of orderedPayloads) {
       const candidate = extractFromRedskyPdp(payload.data);
       if (candidate.name && !fromRedsky.name) fromRedsky.name = candidate.name;
       if (candidate.imageUrl && !fromRedsky.imageUrl) fromRedsky.imageUrl = candidate.imageUrl;
@@ -737,6 +891,15 @@ async function scrapeProductDetail(
         console.log("[DEBUG] redsky url not found in html");
       }
     }
+    if (DEBUG_PDP && !redskyDumped) {
+      redskyDumped = true;
+      try {
+        fs.writeFileSync("/tmp/target-redsky-all.json", JSON.stringify(redskyPayloads, null, 2));
+        console.log("[DEBUG] wrote /tmp/target-redsky-all.json");
+      } catch {
+        // ignore
+      }
+    }
 
     let name =
       fromPreloaded.name ??
@@ -746,7 +909,7 @@ async function scrapeProductDetail(
       normalizeWhitespace($("h1").first().text()) ??
       $('meta[property="og:title"]').attr("content") ??
       null;
-    name = stripWeightBrandSuffix(name);
+    name = normalizeProductName(name);
 
     const ingredients =
       fromPreloaded.ingredients ?? fromRedsky.ingredients ?? fromNext.ingredients ?? parseIngredientsFromDom($);
@@ -757,6 +920,7 @@ async function scrapeProductDetail(
       fromNext.imageUrl ??
       $('meta[property="og:image"]').attr("content") ??
       null;
+    const imageUrlWithParams = addImageParams(imageUrl);
 
     // ✅ UPC: prefer preloaded; otherwise scrape from SPECIFICATIONS section
     let upc12 = fromPreloaded.upc12 ?? fromRedsky.upc12 ?? fromNext.upc12 ?? null;
@@ -784,7 +948,7 @@ async function scrapeProductDetail(
       ingredients: ingredients ?? null,
       upc12,
       nutrition,
-      imageUrl,
+      imageUrl: imageUrlWithParams,
       scrapedAt: now,
       sourceCreatedAt: null,
       sourceLastUpdatedAt: null,
@@ -803,12 +967,12 @@ async function expandListingPage(page: Page): Promise<void> {
     const productCount = await page.locator('a[href*="/p/"][href*="/-/A-"]').count().catch(() => 0);
 
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await page.waitForTimeout(800);
+    await page.waitForTimeout(500);
 
     const loadMore = page.getByRole("button", { name: /load more|show more|view more/i }).first();
     if (await loadMore.isVisible({ timeout: 1000 }).catch(() => false)) {
       await loadMore.click({ timeout: 3000 }).catch(() => null);
-      await page.waitForTimeout(600);
+      await page.waitForTimeout(400);
     }
 
     const newHeight = await page.evaluate(() => document.body.scrollHeight);
@@ -822,6 +986,45 @@ async function expandListingPage(page: Page): Promise<void> {
     }
     lastHeight = newHeight;
   }
+}
+
+function buildListingUrlWithNao(listingUrl: string, nao: number): string {
+  const u = new URL(listingUrl);
+  u.searchParams.set("Nao", String(nao));
+  u.searchParams.set("moveTo", "product-list-grid");
+  return u.toString();
+}
+
+async function paginateListingPages(
+  page: Page,
+  listingUrl: string,
+  limit?: number
+): Promise<string[]> {
+  const out = new Set<string>();
+  const pageSize = 24;
+  const maxPages = 120;
+
+  for (let pageIndex = 0; pageIndex < maxPages; pageIndex++) {
+    if (limit != null && out.size >= limit) break;
+    const nao = pageIndex * pageSize;
+    const pageUrl = buildListingUrlWithNao(listingUrl, nao);
+    if (DEBUG_PDP) console.log(`[DEBUG] listing page: ${pageUrl}`);
+
+    await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.waitForTimeout(1200);
+    await page.waitForSelector('a[href*="/p/"][href*="/-/A-"]', { timeout: 8000 }).catch(() => {});
+
+    const html = await page.content();
+    const urls = extractProductDetailUrls(listingUrl, html);
+    const before = out.size;
+    for (const u of urls) out.add(u);
+    if (DEBUG_PDP) console.log(`[DEBUG] pageIndex ${pageIndex} found ${urls.length}, total ${out.size}`);
+
+    if (urls.length === 0 || out.size === before) break;
+  }
+
+  const all = Array.from(out);
+  return limit != null ? all.slice(0, limit) : all;
 }
 
 function extractProductDetailUrls(listingUrl: string, html: string): string[] {
@@ -853,14 +1056,16 @@ function extractProductDetailUrls(listingUrl: string, html: string): string[] {
   return Array.from(out);
 }
 
-async function scrapeListing(browserContext: BrowserContext, brandCfg: BrandConfig): Promise<string[]> {
+async function scrapeListing(
+  browserContext: BrowserContext,
+  brandCfg: BrandConfig,
+  limit?: number
+): Promise<string[]> {
   const page = await browserContext.newPage();
   try {
     await page.goto(brandCfg.listingUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await page.waitForTimeout(2000);
-    await expandListingPage(page);
-    const html = await page.content();
-    return extractProductDetailUrls(brandCfg.listingUrl, html);
+    await page.waitForTimeout(1200);
+    return await paginateListingPages(page, brandCfg.listingUrl, limit);
   } finally {
     await page.close().catch(() => null);
   }
@@ -902,6 +1107,10 @@ async function getServiceToken(): Promise<string> {
 async function submitProduct(p: ScrapedProduct): Promise<boolean> {
   if (!p.name || !hasIngredientsOrNutrition(p)) {
     console.log(`Skipping ${p.productUrl}: missing name, ingredients, and nutrition (likely raw produce)`);
+    return false;
+  }
+  if (!p.upc12) {
+    console.log(`Skipping ${p.productUrl}: missing UPC`);
     return false;
   }
   try {
@@ -1051,7 +1260,7 @@ async function main(): Promise<void> {
         for (const brandCfg of cfg.brands) {
           if (!brandCfg.listingUrl?.startsWith("https://www.target.com/")) continue;
           console.log(`\n[DISCOVER] ${brandCfg.brand}: ${brandCfg.listingUrl}`);
-          const urls = await scrapeListing(context, brandCfg);
+          const urls = await scrapeListing(context, brandCfg, limit);
           console.log(`[DISCOVER] ${brandCfg.brand}: ${urls.length} product URLs`);
 
           const brand =
@@ -1079,17 +1288,43 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const limiter = pLimit(2);
+  const limiter = pLimit(5);
   const outputs: ScraperProductOutput[] = [];
   let skipped = 0;
 
   try {
-    for (const { url: u, brand } of targets) {
-      const p = await limiter(() => scrapeProductDetail(context, u, brand));
+    const results = await Promise.all(
+      targets.map(({ url: u, brand }) =>
+        limiter(async () => {
+          try {
+            const p = await scrapeProductDetail(context, u, brand);
+            return { product: p, url: u, timedOut: false };
+          } catch (e: any) {
+            if (e?.name === "TimeoutError") {
+              return { product: null as any, url: u, timedOut: true };
+            }
+            throw e;
+          }
+        })
+      )
+    );
+
+    for (const { product: p, url: u, timedOut } of results) {
+      if (timedOut) {
+        skipped++;
+        console.log(`[SKIP] ${u}: timed out after 60s (likely non-product page)`);
+        continue;
+      }
 
       if (!hasIngredientsOrNutrition(p)) {
         skipped++;
         console.log(`[SKIP] ${p.name ?? "(no name)"}: no ingredients and no nutrition`);
+        logScrapedData(p, u);
+        continue;
+      }
+      if (!p.upc12) {
+        skipped++;
+        console.log(`[SKIP] ${p.name ?? "(no name)"}: missing UPC`);
         logScrapedData(p, u);
         continue;
       }
