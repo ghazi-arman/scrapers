@@ -59,6 +59,8 @@ export interface ScraperProductOutput {
   product_name: string;
   brand: string;
   upc?: string;
+  /** List of UPCs; first is primary. Used when product has multiple UPCs (e.g. Trader Joe's SKU-based). */
+  upcs?: string[];
   ingredients_text: string;
   serving_size_value?: number | null;
   serving_size_unit?: string | null;

@@ -59,6 +59,58 @@ You can run any scraper **locally** (no AWS/API) and optionally cap how many pro
 | `--limit N` or `-l N` | Scrape at most N products (after discovery). |
 | `--local` | Skip DynamoDB job status and S3 upload; API submission still runs (use AWS profile for SSM). |
 
+### Debug, Headless, and Config
+
+**Debug mode** – Enable verbose logging for each scraper:
+
+| Scraper | Debug env var | Example |
+|---------|---------------|---------|
+| Amazon | `DEBUG_AMAZON=1` | `DEBUG_AMAZON=1 npx tsx scrape.ts --config config.json --local --limit 1` |
+| Trader Joe's | `DEBUG_TJ=1` | `DEBUG_TJ=1 npx tsx scrape.ts --config config.json --local --limit 1` |
+| Vons | `DEBUG_VONS=1` | `DEBUG_VONS=1 npx tsx scrape.ts --config config.json --local --limit 1` |
+| Target | `DEBUG_TARGET_PDP=1` | `DEBUG_TARGET_PDP=1 npx tsx scrape.ts --config config.json --local --limit 1` |
+
+**Headless** – By default, Playwright runs headless (no browser window). To see the browser window:
+
+| Scraper | Headless env var | Example (headed = show browser) |
+|---------|------------------|---------------------------------|
+| Amazon | `AMAZON_HEADLESS=0` | `AMAZON_HEADLESS=0 npx tsx scrape.ts --config config.json --local --limit 1` |
+| Trader Joe's | `TJ_HEADLESS=0` | `TJ_HEADLESS=0 npx tsx scrape.ts --config config.json --local --limit 1` |
+| Vons | `VONS_HEADLESS=0` | `VONS_HEADLESS=0 npx tsx scrape.ts --config config.json --local --limit 1` |
+
+**Slow motion** (Amazon, Vons) – Add delay between actions (milliseconds) for easier observation:
+
+```bash
+AMAZON_SLOWMO=500 AMAZON_HEADLESS=0 npx tsx scrape.ts --config config.json --local --limit 1
+VONS_SLOWMO=500 VONS_HEADLESS=0 npx tsx scrape.ts --config config.json --local --limit 1
+```
+
+**Playwright Inspector** – Use Playwright’s built‑in debugger (all Playwright scrapers):
+
+```bash
+PWDEBUG=1 npx tsx scrape.ts --config config.json --local --limit 1
+```
+
+This opens the Playwright Inspector so you can step through actions and inspect the page.
+
+**Config** – Each scraper’s config path:
+
+| Scraper | Config option | Default / example |
+|---------|---------------|-------------------|
+| Amazon | `--config <path>` or `-c` | `--config config.json` |
+| Trader Joe's | `--config <path>` | `--config ./config.json` (default) |
+| Vons | `--config <path>` or `-c` | `--config ./config.json` |
+| Target | `--config <path>` or `-c` | `--config ./config.json` |
+| Kraft-Heinz | Positional path | `./brands.config.json` |
+
+**Example – debug + headed + custom config:**
+
+```bash
+cd scrapers/amazon
+DEBUG_AMAZON=1 AMAZON_HEADLESS=0 AMAZON_SLOWMO=300 \
+  npx tsx scrape.ts --config config.json --local --limit 1
+```
+
 **Target scraper options:**
 | Option | Description |
 |--------|-------------|
@@ -85,6 +137,9 @@ cd scrapers/target && npx tsx scrape.ts --url "https://www.target.com/p/ritz-her
 
 # Target: discover & scrape Good & Gather brand (from config.json), limit 5
 cd scrapers/target && npm run scrape:local:limit
+
+# Trader Joe's: local run, limit 5 (reads config.json)
+cd scrapers/trader-joes && npm run scrape:local:limit
 ```
 
 **Full CLI (when not using npm scripts):**
@@ -92,6 +147,7 @@ cd scrapers/target && npm run scrape:local:limit
 - **Kraft-Heinz:** `npx tsx scrape.ts ./brands.config.json [--limit N] [--local]`
 - **Smuckers:** `npx tsx scrape.ts [--concurrency N] [--limit N] [--local]` (default concurrency: 5)
 - **Target:** `npx tsx scrape.ts --url <URL>` or `npx tsx scrape.ts --config ./config.json [--limit N] [--local]` (config can include `brands` with `listingUrl` for discovery, e.g. Good & Gather)
+- **Trader Joe's:** `npx tsx scrape.ts [--config ./config.json] [--limit N] [--local]`
 
 For full runs (with AWS and API), the AWS SDK uses the default credential chain. Configure AWS credentials and set the required environment variables (see Prerequisites above).
 

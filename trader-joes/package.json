@@ -1,0 +1,31 @@
+{
+  "name": "trader-joes-scraper",
+  "version": "1.0.0",
+  "description": "Processes Trader Joe's product data (traderjoes_products.json), generates UPCs from SKU, and submits for review",
+  "type": "module",
+  "scripts": {
+    "scrape": "npx tsx scrape.ts",
+    "scrape:local": "npx tsx scrape.ts --local",
+    "scrape:local:limit": "npx tsx scrape.ts --local --limit 5"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/client-s3": "^3.0.0",
+    "@aws-sdk/client-ssm": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0",
+    "axios": "^1.6.7",
+    "cheerio": "^1.0.0-rc.12",
+    "playwright": "^1.49.1",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/uuid": "^9.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}
