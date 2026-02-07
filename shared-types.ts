@@ -83,6 +83,27 @@ export interface ScraperNutritionData {
   biotin_mcg_qualifier?: NutrientQualifier | null;
   pantothenic_acid_mg?: number | null;
   pantothenic_acid_mg_qualifier?: NutrientQualifier | null;
+  /** DV% when label only shows % DV without absolute amount */
+  vitamin_a_dv_pct?: number | null;
+  vitamin_c_dv_pct?: number | null;
+  vitamin_d_dv_pct?: number | null;
+  vitamin_e_dv_pct?: number | null;
+  vitamin_k_dv_pct?: number | null;
+  thiamin_dv_pct?: number | null;
+  riboflavin_dv_pct?: number | null;
+  niacin_dv_pct?: number | null;
+  vitamin_b6_dv_pct?: number | null;
+  folate_dv_pct?: number | null;
+  folic_acid_dv_pct?: number | null;
+  vitamin_b12_dv_pct?: number | null;
+  biotin_dv_pct?: number | null;
+  pantothenic_acid_dv_pct?: number | null;
+  calcium_dv_pct?: number | null;
+  iron_dv_pct?: number | null;
+  magnesium_dv_pct?: number | null;
+  phosphorus_dv_pct?: number | null;
+  potassium_dv_pct?: number | null;
+  zinc_dv_pct?: number | null;
 }
 
 /**

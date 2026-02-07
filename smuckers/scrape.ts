@@ -7,7 +7,11 @@ import { DynamoDBDocumentClient, PutCommand, UpdateCommand } from "@aws-sdk/lib-
 import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 import { v4 as uuidv4 } from "uuid";
 import type { ScraperProductOutput, ScraperNutritionData } from "../shared-types";
-import { parseNutrientAmountWithQualifier } from "../nutrition-utils";
+import * as nutritionUtils from "../nutrition-utils";
+
+const parseNutrientAmountWithQualifier =
+  (nutritionUtils as any).parseNutrientAmountWithQualifier ??
+  (nutritionUtils as any).default?.parseNutrientAmountWithQualifier;
 
 const PRODUCTS_PAGE = "https://www.smuckers.com/products";
 
@@ -511,6 +515,9 @@ function transformNutritionToDbFormat(nutrition: ScrapedProduct["nutrition"]): S
   for (const [key, nutrient] of Object.entries(nutrition.nutrients)) {
     const columnName = mapNutrientKeyToColumn(key);
     if (columnName) {
+      if (typeof parseNutrientAmountWithQualifier !== "function") {
+        throw new Error("parseNutrientAmountWithQualifier import failed");
+      }
       const parsed = parseNutrientAmountWithQualifier(nutrient.amount);
       if (parsed !== null) {
         result[columnName] = parsed.value;

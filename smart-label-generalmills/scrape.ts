@@ -35,7 +35,7 @@ type ScrapedProduct = {
   sourceLastUpdatedAt: string | null;
 };
 
-const SCRAPER_NAME = process.env.JOB_NAME || "smart-label";
+const SCRAPER_NAME = process.env.JOB_NAME || "smart-label-generalmills";
 const SCRAPER_OUTPUTS_BUCKET = process.env.SCRAPER_OUTPUTS_BUCKET;
 const SCRAPER_JOB_STATUS_TABLE_NAME = process.env.SCRAPER_JOB_STATUS_TABLE_NAME;
 const API_BASE_URL = process.env.API_BASE_URL || "https://it7rdy3qbh.execute-api.us-west-2.amazonaws.com";
@@ -137,6 +137,7 @@ const NUTRIENT_COLUMN_MAP: Record<string, string> = {
   "dietary fiber": "fiber_g",
   sugars: "sugars_g",
   "total sugars": "sugars_g",
+  "total sugar": "sugars_g",
   "added sugars": "added_sugars_g",
   protein: "protein_g",
   "vitamin d": "vitamin_d_mcg",
@@ -331,6 +332,33 @@ function extractIngredientsFromListGroup(
 }
 
 function extractIngredients($: cheerio.CheerioAPI): string | null {
+  const gmList = $("#ingredients-list");
+  if (gmList.length) {
+    const items: string[] = [];
+    gmList.children("li").each((_, li) => {
+      const el = $(li);
+      const baseText = normalizeWhitespace(el.find(".list-title").first().text());
+      const subList = el.find("ul").first();
+      if (subList.length) {
+        const subItems = subList
+          .find(".list-title")
+          .toArray()
+          .map((sub) => normalizeWhitespace($(sub).text()))
+          .filter(Boolean);
+        if (baseText && subItems.length) {
+          items.push(`${baseText} (${joinSubIngredients(subItems, false)})`);
+        } else if (baseText) {
+          items.push(baseText);
+        } else if (subItems.length) {
+          items.push(joinSubIngredients(subItems, false));
+        }
+      } else if (baseText) {
+        items.push(baseText);
+      }
+    });
+    if (items.length) return items.join(", ");
+  }
+
   const smartLabelList = $("#ingredient-list");
   if (smartLabelList.length) {
     const container = smartLabelList.find("ul.list-group").first();
@@ -420,9 +448,6 @@ function parseSmartLabelNutrition($: cheerio.CheerioAPI): { nutrition: ScraperNu
       .toArray()
       .map((el) => decodeHtmlEntities(normalizeWhitespace($(el).text())) || "")
       .filter(Boolean);
-    const dvText = decodeHtmlEntities(
-      normalizeWhitespace($(row).find(".nfp__values-dvp").first().text())
-    );
     let valueText = valueCandidates.find((v) => /<|>|≈|~|\d/.test(v)) || "";
     if (!valueText) {
       valueText = decodeHtmlEntities(normalizeWhitespace($(row).find("span").last().text())) || "";
@@ -437,15 +462,6 @@ function parseSmartLabelNutrition($: cheerio.CheerioAPI): { nutrition: ScraperNu
       if (parsed) {
         (nutrition as unknown as Record<string, number>)[col] = parsed.value;
         if (parsed.qualifier) (nutrition as unknown as Record<string, string>)[`${col}_qualifier`] = parsed.qualifier;
-      }
-    }
-    if (dvText) {
-      const dvCol = mapNutrientToDvColumn(label);
-      if (dvCol) {
-        const dvMatch = dvText.match(/([\d.]+)/);
-        if (dvMatch) {
-          (nutrition as unknown as Record<string, number>)[dvCol] = parseFloat(dvMatch[1]);
-        }
       }
     }
   });
@@ -507,15 +523,6 @@ function extractNutritionFromTables($: cheerio.CheerioAPI, root: cheerio.Cheerio
       if (parsed) {
         (result as unknown as Record<string, number>)[col] = parsed.value;
         if (parsed.qualifier) (result as unknown as Record<string, string>)[`${col}_qualifier`] = parsed.qualifier;
-      }
-    }
-    if (val2) {
-      const dvCol = mapNutrientToDvColumn(label);
-      if (dvCol) {
-        const dvMatch = val2.match(/([\d.]+)/);
-        if (dvMatch) {
-          (result as unknown as Record<string, number>)[dvCol] = parseFloat(dvMatch[1]);
-        }
       }
     }
     if (label.includes("added sugars") && val1) {
@@ -667,6 +674,7 @@ async function fetchNutritionHtmlGuess(url: string, html: string): Promise<strin
 
 function extractHeaderName($: cheerio.CheerioAPI): string | null {
   const headerName =
+    $(".product-header-name").first().text() ||
     $(".product-header-name h1").first().text() ||
     $("[class*='Header__Title']").first().text() ||
     $(".Header__Title").first().text();
@@ -733,6 +741,11 @@ function stripWeightFromName(name: string | null): string | null {
   return formatted;
 }
 
+function stripCountSuffix(name: string | null): string | null {
+  if (!name) return null;
+  return name.replace(/,\s*\d+\s*[- ]?count$/i, "").trim();
+}
+
 function removeBrandPrefix(name: string | null, brand: string | null): string | null {
   if (!name || !brand) return name;
   const lowerName = name.toLowerCase();
@@ -758,6 +771,12 @@ function isOnlyWaterIngredients(text: string | null): boolean {
 }
 
 function extractImage($: cheerio.CheerioAPI, baseOrigin: string): string | null {
+  const gmImage = $(".product-image").first().attr("src");
+  if (gmImage) {
+    if (gmImage.startsWith("http")) return gmImage;
+    if (gmImage.startsWith("/")) return `${baseOrigin}${gmImage}`;
+    return gmImage;
+  }
   const og = $("meta[property='og:image']").attr("content");
   if (og) {
     if (og.startsWith("http")) return og;
@@ -769,6 +788,104 @@ function extractImage($: cheerio.CheerioAPI, baseOrigin: string): string | null 
   if (img.startsWith("http")) return img;
   if (img.startsWith("/")) return `${baseOrigin}${img}`;
   return img;
+}
+
+function isLogoImage(url: string | null): boolean {
+  if (!url) return false;
+  return /smart_label_logo/i.test(url);
+}
+
+function extractUpcFromHeader($: cheerio.CheerioAPI): string | null {
+  const upcText = normalizeWhitespace($(".upc").first().text());
+  if (!upcText) return null;
+  const match = upcText.match(/\d+/g)?.join("") ?? "";
+  if (match.length >= 12) return match.slice(-12);
+  return null;
+}
+
+function parseGeneralMillsNutrition(
+  $: cheerio.CheerioAPI
+): { nutrition: ScraperNutritionData | null; servingSizeText: string | null } {
+  const container = $(".nutritional-container").first();
+  if (!container.length) return { nutrition: null, servingSizeText: null };
+
+  const nutrition: ScraperNutritionData = {
+    serving_size_value: 1,
+    serving_size_unit_text: "serving",
+    serving_size_text: null,
+  };
+
+  const servingSizeText = normalizeWhitespace(container.find(".servings p").last().text());
+  if (servingSizeText) {
+    nutrition.serving_size_text = servingSizeText;
+    const parsed = parseServingSize(servingSizeText);
+    nutrition.serving_size_value = parsed.value ?? 1;
+    nutrition.serving_size_unit_text = parsed.unit ?? "serving";
+  }
+
+  const caloriesText = normalizeWhitespace(container.find(".calorie-value .cal p").last().text());
+  if (caloriesText) {
+    const parsed = parseNutrientAmountWithQualifier(caloriesText);
+    if (parsed) {
+      nutrition.calories = parsed.value;
+      if (parsed.qualifier) nutrition.calories_qualifier = parsed.qualifier;
+    }
+  }
+
+  container.find("ul.nutrition-properties > li").each((_, li) => {
+    const label = normalizeWhitespace($(li).find("label").first().text()).toLowerCase();
+    const valueText = normalizeWhitespace($(li).find(".gram-value").first().text());
+    const dvText = normalizeWhitespace($(li).find(".dv-result").first().text());
+    if (!label) return;
+    if (DEBUG_SMART_LABEL) {
+      console.log(`[DEBUG] nutrition row: label="${label}" value="${valueText}"`);
+    }
+    let col = mapNutrientToColumn(label);
+    if (label.startsWith("includes")) {
+      const added = normalizeWhitespace($(li).find("span.no-bold").last().text()).toLowerCase();
+      if (added.includes("added sugar")) col = "added_sugars_g";
+    }
+    if (col && valueText) {
+      const parsed = parseNutrientAmountWithQualifier(valueText);
+      if (parsed) {
+        (nutrition as unknown as Record<string, number>)[col] = parsed.value;
+        if (parsed.qualifier) (nutrition as unknown as Record<string, string>)[`${col}_qualifier`] = parsed.qualifier;
+      }
+    }
+
+    if (dvText) {
+      const dvCol = mapNutrientToDvColumn(label);
+      if (dvCol) {
+        const dvMatch = dvText.match(/([\d.]+)/);
+        if (dvMatch) {
+          (nutrition as unknown as Record<string, number>)[dvCol] = parseFloat(dvMatch[1]);
+        }
+      }
+    }
+  });
+
+  const hasNutrients = Object.keys(nutrition).some((k) =>
+    [
+      "calories",
+      "protein_g",
+      "total_carbs_g",
+      "fiber_g",
+      "sugars_g",
+      "added_sugars_g",
+      "total_fat_g",
+      "saturated_fat_g",
+      "trans_fat_g",
+      "cholesterol_mg",
+      "sodium_mg",
+      "potassium_mg",
+      "calcium_mg",
+      "iron_mg",
+      "vitamin_d_mcg",
+      "folate_mcg",
+      "folic_acid_mcg",
+    ].includes(k)
+  );
+  return { nutrition: hasNutrients ? nutrition : null, servingSizeText: nutrition.serving_size_text ?? null };
 }
 
 async function fetchRenderedHtml(browser: Browser, url: string): Promise<string> {
@@ -857,7 +974,7 @@ async function discoverProductUrls(
       const hrefs = await page.$$eval("a[href]", (links) =>
         links
           .map((a) => (a as HTMLAnchorElement).href)
-          .filter((href) => /smartlabel\.(pepsico|hersheys)\.info/i.test(href))
+          .filter((href) => /smartlabel\.generalmills\.com/i.test(href))
       );
       for (const href of hrefs) {
         if (!href) continue;
@@ -879,7 +996,7 @@ async function discoverProductUrls(
       await page
         .waitForFunction(
           (prev) => {
-            const first = document.querySelector("a[href*='smartlabel.pepsico.info']") as HTMLAnchorElement | null;
+            const first = document.querySelector("a[href*='smartlabel.generalmills.com']") as HTMLAnchorElement | null;
             return !!first && first.href !== prev;
           },
           firstHref,
@@ -937,12 +1054,13 @@ async function fetchProduct(
   const $ = cheerio.load(html);
   const headerName = extractHeaderName($);
   const headerBrand = extractHeaderBrand($);
+  const headerUpc = extractUpcFromHeader($);
   const rawName =
     headerName ||
     extractName($);
   const useHeaderBrand = isLikelyBrand(headerBrand) && !!headerName;
   const derived = useHeaderBrand ? { brand: headerBrand, name: rawName } : deriveBrandAndName(rawName);
-  const brand =
+  let brand =
     ((useHeaderBrand ? headerBrand : derived.brand) ||
       extractBrand($) ||
       "Unknown"
@@ -950,6 +1068,7 @@ async function fetchProduct(
   const reordered = reorderName ? deriveBrandAndName(rawName) : { name: rawName };
   const baseName = headerName || (reordered.name ?? derived.name) || rawName;
   let name = baseName ? baseName.trim() : baseName;
+  name = stripCountSuffix(name);
   const preBrandName = name;
   
   if (name && brand) {
@@ -970,18 +1089,35 @@ async function fetchProduct(
   const baseOrigin = new URL(url).origin;
   let imageUrl: string | null = extractImage($, baseOrigin);
 
-  const upcFromText = extractUpc(html) || extractUpc($("body").text());
-  const nutritionSection = extractNutritionSection($);
+  let upcFromText = headerUpc || extractUpc(html) || extractUpc($("body").text());
   let nutrition: ScraperNutritionData | null = null;
   let servingSizeText: string | null = null;
-  if (nutritionSection) {
-    nutrition = extractNutritionFromTables($, nutritionSection);
-    if (nutrition?.serving_size_text) servingSizeText = nutrition.serving_size_text;
-  }
-  if (!nutrition) {
-    const fallback = extractNutritionFromText($("body").text());
-    nutrition = fallback.nutrition;
-    servingSizeText = fallback.servingSizeText;
+  const gmNutrition = parseGeneralMillsNutrition($);
+  nutrition = gmNutrition.nutrition;
+  servingSizeText = gmNutrition.servingSizeText;
+
+  if (!nutrition || !headerName || !headerBrand || !upcFromText || !imageUrl || isLogoImage(imageUrl)) {
+    const renderedBase = await fetchRenderedHtml(browser, url);
+    if (DEBUG_SMART_LABEL) {
+      await fs.writeFile("/tmp/smart-label-rendered.html", renderedBase).catch(() => null);
+    }
+    const $base = cheerio.load(renderedBase);
+    if (!headerName) {
+      const baseHeaderName = extractHeaderName($base);
+      if (baseHeaderName) {
+        name = stripCountSuffix(baseHeaderName);
+      }
+    }
+    if (!headerBrand) {
+      const baseBrand = extractHeaderBrand($base);
+      if (baseBrand) {
+        brand = baseBrand;
+      }
+    }
+    if (!upcFromText) {
+      upcFromText = extractUpcFromHeader($base) || extractUpc(renderedBase) || extractUpc($base("body").text());
+    }
+    if (!imageUrl || isLogoImage(imageUrl)) imageUrl = extractImage($base, baseOrigin);
   }
 
   if (!nutrition) {
@@ -991,24 +1127,16 @@ async function fetchProduct(
       await fs.writeFile("/tmp/smart-label-rendered-nutrition.html", renderedNutrition).catch(() => null);
     }
     const $r = cheerio.load(renderedNutrition);
+    if (!nutrition) {
+      const gmParsed = parseGeneralMillsNutrition($r);
+      nutrition = gmParsed.nutrition;
+      servingSizeText = gmParsed.servingSizeText ?? servingSizeText;
+    }
     if (!name) {
       const header = extractHeaderName($r) || extractName($r);
       if (header) name = stripWeightFromName(header);
     }
     if (!imageUrl) imageUrl = extractImage($r, baseOrigin);
-    const parsedNutrition = parseSmartLabelNutrition($r);
-    nutrition = parsedNutrition.nutrition;
-    servingSizeText = parsedNutrition.servingSizeText ?? servingSizeText;
-    if (!nutrition) {
-      const section = extractNutritionSection($r);
-      nutrition = section ? extractNutritionFromTables($r, section) : null;
-      if (!nutrition) {
-        const fallback = extractNutritionFromText($r("body").text());
-        nutrition = fallback.nutrition;
-        servingSizeText = fallback.servingSizeText;
-      }
-      if (nutrition?.serving_size_text) servingSizeText = nutrition.serving_size_text;
-    }
   }
 
   if (!ingredientsText) {

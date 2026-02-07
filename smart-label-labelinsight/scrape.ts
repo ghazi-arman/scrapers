@@ -166,6 +166,39 @@ function mapNutrientToColumn(name: string): string | null {
   return null;
 }
 
+const NUTRIENT_DV_COLUMN_MAP: Record<string, string> = {
+  "vitamin a": "vitamin_a_dv_pct",
+  "vitamin c": "vitamin_c_dv_pct",
+  "vitamin d": "vitamin_d_dv_pct",
+  "vitamin e": "vitamin_e_dv_pct",
+  "vitamin k": "vitamin_k_dv_pct",
+  thiamin: "thiamin_dv_pct",
+  riboflavin: "riboflavin_dv_pct",
+  niacin: "niacin_dv_pct",
+  "vitamin b6": "vitamin_b6_dv_pct",
+  folate: "folate_dv_pct",
+  "folic acid": "folic_acid_dv_pct",
+  "vitamin b12": "vitamin_b12_dv_pct",
+  biotin: "biotin_dv_pct",
+  "pantothenic acid": "pantothenic_acid_dv_pct",
+  calcium: "calcium_dv_pct",
+  iron: "iron_dv_pct",
+  magnesium: "magnesium_dv_pct",
+  phosphorus: "phosphorus_dv_pct",
+  potassium: "potassium_dv_pct",
+  zinc: "zinc_dv_pct",
+};
+
+function mapNutrientToDvColumn(name: string): string | null {
+  const lower = name.toLowerCase().trim();
+  if (lower.includes("folic acid")) return "folic_acid_dv_pct";
+  if (lower.includes("folate")) return "folate_dv_pct";
+  for (const [key, col] of Object.entries(NUTRIENT_DV_COLUMN_MAP)) {
+    if (lower.includes(key)) return col;
+  }
+  return null;
+}
+
 function cleanAndOrText(text: string): { text: string; andOr: boolean } {
   const trimmed = text.trim();
   const andOrMatch = /^and\/?or\s+/i;
@@ -178,10 +211,15 @@ function cleanAndOrText(text: string): { text: string; andOr: boolean } {
 function joinSubIngredients(items: string[], hasAndOr: boolean): string {
   if (items.length === 0) return "";
   if (items.length === 1) return items[0];
-  const head = items.slice(0, -1).join(", ");
-  const last = items[items.length - 1];
-  const conj = hasAndOr ? "and/or" : "and";
-  return `${head}, ${conj} ${last}`;
+  if (hasAndOr) {
+    if (items.length === 2) {
+      return `${items[0]} and/or ${items[1]}`;
+    }
+    const head = items.slice(0, -1).join(", ");
+    const last = items[items.length - 1];
+    return `${head}, and/or ${last}`;
+  }
+  return items.join(", ");
 }
 
 function parseIngredientList($: cheerio.CheerioAPI, root: cheerio.Cheerio<cheerio.Element>): string[] {
@@ -531,6 +569,7 @@ function parseLabelInsightNutritionJson(payload: any): { nutrition: ScraperNutri
   for (const n of nutrients) {
     const name = String(n?.name || "");
     const valueText = String(n?.value || "");
+    const dvText = String(n?.dvp || "");
     if (DEBUG_SMART_LABEL) {
       console.log(`[DEBUG] nutrition row: label="${name}" value="${valueText}"`);
     }
@@ -540,9 +579,19 @@ function parseLabelInsightNutritionJson(payload: any): { nutrition: ScraperNutri
       continue;
     }
     const col = mapNutrientToColumn(name);
-    if (!col) continue;
-    const parsed = parseNutrientAmountWithQualifier(valueText);
-    if (parsed) (nutrition as unknown as Record<string, number>)[col] = parsed.value;
+    if (col && valueText) {
+      const parsed = parseNutrientAmountWithQualifier(valueText);
+      if (parsed) (nutrition as unknown as Record<string, number>)[col] = parsed.value;
+    }
+    if (dvText) {
+      const dvCol = mapNutrientToDvColumn(name);
+      if (dvCol) {
+        const dvMatch = dvText.match(/([\d.]+)/);
+        if (dvMatch) {
+          (nutrition as unknown as Record<string, number>)[dvCol] = parseFloat(dvMatch[1]);
+        }
+      }
+    }
   }
   const hasNutrients = Object.keys(nutrition).some((k) =>
     [
@@ -605,6 +654,15 @@ function extractNutritionFromTables($: cheerio.CheerioAPI, root: cheerio.Cheerio
       if (parsed) {
         (result as unknown as Record<string, number>)[col] = parsed.value;
         if (parsed.qualifier) (result as unknown as Record<string, string>)[`${col}_qualifier`] = parsed.qualifier;
+      }
+    }
+    if (val2) {
+      const dvCol = mapNutrientToDvColumn(label);
+      if (dvCol) {
+        const dvMatch = val2.match(/([\d.]+)/);
+        if (dvMatch) {
+          (result as unknown as Record<string, number>)[dvCol] = parseFloat(dvMatch[1]);
+        }
       }
     }
     if (label.includes("added sugars") && val1) {
