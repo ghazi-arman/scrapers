@@ -7,6 +7,7 @@ import { DynamoDBDocumentClient, PutCommand, UpdateCommand } from "@aws-sdk/lib-
 import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 import { v4 as uuidv4 } from "uuid";
 import type { ScraperProductOutput, ScraperNutritionData } from "../shared-types";
+import { parseNutrientAmountWithQualifier } from "../nutrition-utils";
 
 const PRODUCTS_PAGE = "https://www.smuckers.com/products";
 
@@ -447,22 +448,6 @@ function parseServingSize(servingSizeText: string | null): { value: number | nul
   return { value: null, unit: null };
 }
 
-/**
- * Parse nutrient amount string (e.g., "0g", "240mg") into numeric value
- */
-function parseNutrientAmount(amount: string | null): number | null {
-  if (!amount || typeof amount !== "string") return null;
-
-  const cleaned = amount.trim();
-  const match = cleaned.match(/^(\d+(?:\.\d+)?)/);
-
-  if (match) {
-    const value = parseFloat(match[1]);
-    return isNaN(value) ? null : value;
-  }
-
-  return null;
-}
 
 /**
  * Map nutrient key to database column name
@@ -522,14 +507,14 @@ function transformNutritionToDbFormat(nutrition: ScrapedProduct["nutrition"]): S
     result.calories = nutrition.calories;
   }
 
-  // Map nutrients to database columns
+  // Map nutrients to database columns (with qualifier support for <1g, >5mg, ~10g, etc.)
   for (const [key, nutrient] of Object.entries(nutrition.nutrients)) {
     const columnName = mapNutrientKeyToColumn(key);
     if (columnName) {
-      // Extract numeric value from amount string (e.g., "0g" -> 0, "240mg" -> 240)
-      const value = parseNutrientAmount(nutrient.amount);
-      if (value !== null) {
-        result[columnName] = value;
+      const parsed = parseNutrientAmountWithQualifier(nutrient.amount);
+      if (parsed !== null) {
+        result[columnName] = parsed.value;
+        if (parsed.qualifier) result[`${columnName}_qualifier`] = parsed.qualifier;
       }
     }
   }

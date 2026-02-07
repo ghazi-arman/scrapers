@@ -11,6 +11,7 @@ import { DynamoDBDocumentClient, PutCommand, UpdateCommand } from "@aws-sdk/lib-
 import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 import { v4 as uuidv4 } from "uuid";
 import type { ScraperProductOutput, ScraperNutritionData } from "../shared-types";
+import { parseNutrientAmountWithQualifier } from "../nutrition-utils";
 
 type BrandConfig = {
   brand: string;
@@ -152,25 +153,6 @@ function parseServingSize(servingSizeText: string | null): { value: number | nul
   return { value: null, unit: null };
 }
 
-/**
- * Parse nutrient amount string (e.g., "0g", "240mg", "0.1 mg", "20 ") into numeric value
- * Extracts the numeric value, ignoring the unit (units are determined by the column name)
- */
-function parseNutrientAmount(amount: string | null): number | null {
-  if (!amount || typeof amount !== 'string') return null;
-  
-  // Remove whitespace and match number (with optional unit)
-  const cleaned = amount.trim();
-  // Match number at the start, optionally followed by unit
-  const match = cleaned.match(/^(\d+(?:\.\d+)?)/);
-  
-  if (match) {
-    const value = parseFloat(match[1]);
-    return isNaN(value) ? null : value;
-  }
-  
-  return null;
-}
 
 /**
  * Map nutrient name to database column name
@@ -251,13 +233,16 @@ function transformNutritionToDbFormat(nutrition: Nutrition | null): ScraperNutri
     result.calories = calories;
   }
   
-  // Map nutrients to database columns
+  // Map nutrients to database columns (with qualifier support for <1g, >5mg, ~10g, etc.)
   for (const nutrient of nutrition.nutrients) {
     const columnName = mapNutrientNameToColumn(nutrient.name);
     if (columnName) {
-      const value = parseNutrientAmount(nutrient.amount);
-      if (value !== null) {
-        result[columnName] = value;
+      const parsed = parseNutrientAmountWithQualifier(nutrient.amount);
+      if (parsed !== null) {
+        result[columnName] = parsed.value;
+        if (parsed.qualifier) {
+          result[`${columnName}_qualifier`] = parsed.qualifier;
+        }
       }
     }
   }

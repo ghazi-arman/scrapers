@@ -8,6 +8,7 @@ import { DynamoDBDocumentClient, PutCommand, UpdateCommand } from "@aws-sdk/lib-
 import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 import { v4 as uuidv4 } from "uuid";
 import type { ScraperProductOutput, ScraperNutritionData } from "../shared-types";
+import { parseNutrientAmountWithQualifier } from "../nutrition-utils";
 
 type BrandConfig = {
   brand: string;
@@ -99,11 +100,6 @@ function parseServingSize(servingSizeText: string | null): { value: number | nul
   return { value: null, unit: null };
 }
 
-function parseNutrientAmount(amount: string | null): number | null {
-  if (!amount || typeof amount !== "string") return null;
-  const match = amount.trim().match(/^(\d+(?:\.\d+)?)/);
-  return match ? parseFloat(match[1]) : null;
-}
 
 const NUTRIENT_COLUMN_MAP: Record<string, string> = {
   "total fat": "total_fat_g",
@@ -156,8 +152,11 @@ function transformNutritionToDb(nutrition: Nutrition | null): ScraperNutritionDa
   for (const n of nutrition.nutrients || []) {
     const col = mapNutrientToColumn(n.name);
     if (col) {
-      const val = parseNutrientAmount(n.amount);
-      if (val !== null) (result as unknown as Record<string, number>)[col] = val;
+      const parsed = parseNutrientAmountWithQualifier(n.amount);
+      if (parsed !== null) {
+        (result as unknown as Record<string, number>)[col] = parsed.value;
+        if (parsed.qualifier) (result as unknown as Record<string, string>)[`${col}_qualifier`] = parsed.qualifier;
+      }
     }
   }
 
