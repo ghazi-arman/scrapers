@@ -75,6 +75,8 @@ export interface ScraperNutritionData {
   vitamin_b6_mg_qualifier?: NutrientQualifier | null;
   folate_mcg?: number | null;
   folate_mcg_qualifier?: NutrientQualifier | null;
+  folic_acid_mcg?: number | null;
+  folic_acid_mcg_qualifier?: NutrientQualifier | null;
   vitamin_b12_mcg?: number | null;
   vitamin_b12_mcg_qualifier?: NutrientQualifier | null;
   biotin_mcg?: number | null;

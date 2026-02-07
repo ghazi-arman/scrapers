@@ -148,7 +148,7 @@ const NUTRIENT_COLUMN_MAP: Record<string, string> = {
   "vitamin b3": "niacin_mg",
   niacin: "niacin_mg",
   folate: "folate_mcg",
-  "folic acid": "folate_mcg",
+  "folic acid": "folic_acid_mcg",
   calcium: "calcium_mg",
   iron: "iron_mg",
   potassium: "potassium_mg",
@@ -158,7 +158,7 @@ function mapNutrientToColumn(name: string): string | null {
   const lower = name.toLowerCase().trim();
   if (lower.includes("added sugars")) return "added_sugars_g";
   if (lower.includes("total sugars")) return "sugars_g";
-  if (lower.includes("folic acid")) return null;
+  if (lower.includes("folic acid")) return "folic_acid_mcg";
   if (lower.includes("folate")) return "folate_mcg";
   for (const [key, col] of Object.entries(NUTRIENT_COLUMN_MAP)) {
     if (lower.includes(key)) return col;
@@ -465,6 +465,7 @@ function parseSmartLabelNutrition($: cheerio.CheerioAPI): { nutrition: ScraperNu
       "riboflavin_mg",
       "niacin_mg",
       "folate_mcg",
+      "folic_acid_mcg",
     ].includes(k)
   );
   return { nutrition: hasNutrients ? nutrition : null, servingSizeText: nutrition.serving_size_text ?? null };
@@ -565,6 +566,7 @@ function parseLabelInsightNutritionJson(payload: any): { nutrition: ScraperNutri
       "riboflavin_mg",
       "niacin_mg",
       "folate_mcg",
+      "folic_acid_mcg",
     ].includes(k)
   );
   if (!hasNutrients) return { nutrition: null, servingSizeText: nutrition.serving_size_text ?? null };
@@ -682,6 +684,7 @@ function extractNutritionFromTables($: cheerio.CheerioAPI, root: cheerio.Cheerio
       "riboflavin_mg",
       "niacin_mg",
       "folate_mcg",
+      "folic_acid_mcg",
     ].includes(k)
   );
   return hasNutrients ? result : null;

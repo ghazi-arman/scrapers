@@ -8,7 +8,11 @@ import { DynamoDBDocumentClient, PutCommand, UpdateCommand } from "@aws-sdk/lib-
 import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 import { v4 as uuidv4 } from "uuid";
 import type { ScraperProductOutput, ScraperNutritionData } from "../shared-types";
-import { parseNutrientAmountWithQualifier } from "../nutrition-utils";
+import * as nutritionUtils from "../nutrition-utils";
+
+const parseNutrientAmountWithQualifier =
+  (nutritionUtils as any).parseNutrientAmountWithQualifier ??
+  (nutritionUtils as any).default?.parseNutrientAmountWithQualifier;
 
 type AppConfig = {
   urls?: string[];
@@ -137,10 +141,30 @@ const NUTRIENT_COLUMN_MAP: Record<string, string> = {
   "vitamin c": "vitamin_c_mg",
   "vitamin e": "vitamin_e_mg",
   "vitamin k": "vitamin_k_mcg",
+  "vitamin b1": "thiamin_mg",
+  thiamin: "thiamin_mg",
+  "vitamin b2": "riboflavin_mg",
+  riboflavin: "riboflavin_mg",
+  "vitamin b3": "niacin_mg",
+  niacin: "niacin_mg",
+  "vitamin b6": "vitamin_b6_mg",
+  folate: "folate_mcg",
+  "folate dfe": "folate_mcg",
+  "folic acid": "folic_acid_mcg",
+  "vitamin b12": "vitamin_b12_mcg",
+  biotin: "biotin_mcg",
+  "pantothenic acid": "pantothenic_acid_mg",
+  magnesium: "magnesium_mg",
+  phosphorus: "phosphorus_mg",
+  zinc: "zinc_mg",
 };
 
 function mapNutrientToColumn(name: string): string | null {
   const lower = name.toLowerCase().trim();
+  if (lower.includes("added sugars")) return "added_sugars_g";
+  if (lower.includes("total sugars")) return "sugars_g";
+  if (lower.includes("folic acid")) return "folic_acid_mcg";
+  if (lower.includes("folate")) return "folate_mcg";
   for (const [key, col] of Object.entries(NUTRIENT_COLUMN_MAP)) {
     if (lower.includes(key)) return col;
   }
@@ -168,7 +192,13 @@ function transformNutritionToDb(nutrition: Nutrition | null): ScraperNutritionDa
 
   for (const n of nutrition.nutrients || []) {
     const col = mapNutrientToColumn(n.name);
+    if (process.env.DEBUG_AMAZON === "1") {
+      console.log(`[DEBUG] nutrition row: label="${n.name}" amount="${n.amount}" mapped="${col ?? "(none)"}"`);
+    }
     if (col) {
+      if (typeof parseNutrientAmountWithQualifier !== "function") {
+        throw new Error("parseNutrientAmountWithQualifier import failed");
+      }
       const parsed = parseNutrientAmountWithQualifier(n.amount);
       if (parsed !== null) {
         (result as unknown as Record<string, number>)[col] = parsed.value;

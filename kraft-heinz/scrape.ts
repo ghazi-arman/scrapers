@@ -11,7 +11,11 @@ import { DynamoDBDocumentClient, PutCommand, UpdateCommand } from "@aws-sdk/lib-
 import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 import { v4 as uuidv4 } from "uuid";
 import type { ScraperProductOutput, ScraperNutritionData } from "../shared-types";
-import { parseNutrientAmountWithQualifier } from "../nutrition-utils";
+import * as nutritionUtils from "../nutrition-utils";
+
+const parseNutrientAmountWithQualifier =
+  (nutritionUtils as any).parseNutrientAmountWithQualifier ??
+  (nutritionUtils as any).default?.parseNutrientAmountWithQualifier;
 
 type BrandConfig = {
   brand: string;
@@ -237,6 +241,9 @@ function transformNutritionToDbFormat(nutrition: Nutrition | null): ScraperNutri
   for (const nutrient of nutrition.nutrients) {
     const columnName = mapNutrientNameToColumn(nutrient.name);
     if (columnName) {
+      if (typeof parseNutrientAmountWithQualifier !== "function") {
+        throw new Error("parseNutrientAmountWithQualifier import failed");
+      }
       const parsed = parseNutrientAmountWithQualifier(nutrient.amount);
       if (parsed !== null) {
         result[columnName] = parsed.value;
@@ -1346,14 +1353,18 @@ async function scrapeProductDetail(browser: Browser, brandCfg: BrandConfig, prod
   }
 }
 
-/** Parse CLI args: config path (required), --limit N, --local */
-function parseKraftHeinzArgs(): { configPath: string; limit?: number; local: boolean } {
+/** Parse CLI args: config path (optional), --url, --limit N, --local */
+function parseKraftHeinzArgs(): { configPath?: string; url?: string; limit?: number; local: boolean } {
   const argv = process.argv.slice(2);
   let configPath: string | undefined;
+  let url: string | undefined;
   let limit: number | undefined;
   let local = false;
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === "--limit" || argv[i] === "-l") {
+    if ((argv[i] === "--url" || argv[i] === "-u") && argv[i + 1]) {
+      url = argv[i + 1];
+      i++;
+    } else if (argv[i] === "--limit" || argv[i] === "-l") {
       const n = parseInt(argv[i + 1], 10);
       if (!isNaN(n) && n > 0) {
         limit = n;
@@ -1365,21 +1376,21 @@ function parseKraftHeinzArgs(): { configPath: string; limit?: number; local: boo
       configPath = argv[i];
     }
   }
-  return { configPath: configPath!, limit, local };
+  return { configPath, url, limit, local };
 }
 
 async function main(): Promise<void> {
-  const { configPath, limit: productLimit, local } = parseKraftHeinzArgs();
-  if (!configPath) {
-    console.error("Usage: npx tsx scrape.ts ./brands.config.json [--limit N] [--local]");
+  const { configPath, url, limit: productLimit, local } = parseKraftHeinzArgs();
+  if (!configPath && !url) {
+    console.error("Usage: npx tsx scrape.ts ./brands.config.json [--limit N] [--local] | --url <productUrl> [--local]");
     console.error("  --limit N   Scrape at most N products (default: no limit)");
     console.error("  --local     Skip AWS (DynamoDB, S3) and API submission; run scraping only");
     process.exit(1);
   }
 
-  const cfg = JSON.parse(fs.readFileSync(configPath, "utf8")) as AppConfig;
+  const cfg = configPath ? (JSON.parse(fs.readFileSync(configPath, "utf8")) as AppConfig) : null;
 
-  if (!Array.isArray(cfg.brands) || cfg.brands.length === 0) {
+  if (cfg && (!Array.isArray(cfg.brands) || cfg.brands.length === 0)) {
     throw new Error("Invalid config: must include non-empty brands[]");
   }
 
@@ -1443,14 +1454,21 @@ async function main(): Promise<void> {
     // 1) Discover product detail URLs for each brand
     const allTargets: Array<{ brandCfg: BrandConfig; url: string }> = [];
 
-    for (const brandCfg of cfg.brands) {
-      if (productLimit != null && allTargets.length >= productLimit) break;
-      console.log(`\n[DISCOVER] ${brandCfg.brand}: ${brandCfg.listingUrl}`);
-      const urls = await scrapeListing(browser, brandCfg);
-      console.log(`[DISCOVER] ${brandCfg.brand}: ${urls.length} product URLs`);
-      for (const url of urls) {
-        allTargets.push({ brandCfg, url });
+    if (url) {
+      allTargets.push({
+        brandCfg: { brand: "Kraft Heinz", source: "kraftheinz", listingUrl: "" },
+        url,
+      });
+    } else if (cfg) {
+      for (const brandCfg of cfg.brands) {
         if (productLimit != null && allTargets.length >= productLimit) break;
+        console.log(`\n[DISCOVER] ${brandCfg.brand}: ${brandCfg.listingUrl}`);
+        const urls = await scrapeListing(browser, brandCfg);
+        console.log(`[DISCOVER] ${brandCfg.brand}: ${urls.length} product URLs`);
+        for (const u of urls) {
+          allTargets.push({ brandCfg, url: u });
+          if (productLimit != null && allTargets.length >= productLimit) break;
+        }
       }
     }
 
@@ -1461,7 +1479,7 @@ async function main(): Promise<void> {
     }
 
     // 2) Scrape details with bounded concurrency
-    const concurrencyLimit = pLimit(Math.max(1, cfg.concurrency ?? 4));
+    const concurrencyLimit = pLimit(Math.max(1, cfg?.concurrency ?? 4));
 
     const results = await Promise.all(
       targets.map(({ brandCfg, url }) =>

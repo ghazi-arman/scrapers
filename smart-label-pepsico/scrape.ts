@@ -141,6 +141,8 @@ const NUTRIENT_COLUMN_MAP: Record<string, string> = {
   protein: "protein_g",
   "vitamin d": "vitamin_d_mcg",
   "vitamin c": "vitamin_c_mg",
+  folate: "folate_mcg",
+  "folic acid": "folic_acid_mcg",
   calcium: "calcium_mg",
   iron: "iron_mg",
   potassium: "potassium_mg",
@@ -150,6 +152,8 @@ function mapNutrientToColumn(name: string): string | null {
   const lower = name.toLowerCase().trim();
   if (lower.includes("added sugars")) return "added_sugars_g";
   if (lower.includes("total sugars")) return "sugars_g";
+  if (lower.includes("folic acid")) return "folic_acid_mcg";
+  if (lower.includes("folate")) return "folate_mcg";
   for (const [key, col] of Object.entries(NUTRIENT_COLUMN_MAP)) {
     if (lower.includes(key)) return col;
   }
@@ -413,6 +417,8 @@ function parseSmartLabelNutrition($: cheerio.CheerioAPI): { nutrition: ScraperNu
       "calcium_mg",
       "iron_mg",
       "vitamin_d_mcg",
+      "folate_mcg",
+      "folic_acid_mcg",
     ].includes(k)
   );
   return { nutrition: hasNutrients ? nutrition : null, servingSizeText: nutrition.serving_size_text ?? null };
@@ -525,6 +531,8 @@ function extractNutritionFromTables($: cheerio.CheerioAPI, root: cheerio.Cheerio
       "calcium_mg",
       "iron_mg",
       "vitamin_d_mcg",
+      "folate_mcg",
+      "folic_acid_mcg",
     ].includes(k)
   );
   return hasNutrients ? result : null;
