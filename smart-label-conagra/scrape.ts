@@ -13,7 +13,7 @@ import type { ScraperProductOutput, ScraperNutritionData } from "../shared-types
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-type UrlEntry = string | { url: string; stripWeight?: boolean; reorderName?: boolean };
+type UrlEntry = string | { url: string; stripWeight?: boolean; reorderName?: boolean; name?: string; brand?: string };
 
 type AppConfig = {
   urls?: UrlEntry[];
@@ -35,7 +35,7 @@ type ScrapedProduct = {
   sourceLastUpdatedAt: string | null;
 };
 
-const SCRAPER_NAME = process.env.JOB_NAME || "smart-label-kellogg";
+const SCRAPER_NAME = process.env.JOB_NAME || "smart-label-conagra";
 const SCRAPER_OUTPUTS_BUCKET = process.env.SCRAPER_OUTPUTS_BUCKET;
 const SCRAPER_JOB_STATUS_TABLE_NAME = process.env.SCRAPER_JOB_STATUS_TABLE_NAME;
 const API_BASE_URL = process.env.API_BASE_URL || "https://it7rdy3qbh.execute-api.us-west-2.amazonaws.com";
@@ -137,7 +137,6 @@ const NUTRIENT_COLUMN_MAP: Record<string, string> = {
   "dietary fiber": "fiber_g",
   sugars: "sugars_g",
   "total sugars": "sugars_g",
-  "total sugar": "sugars_g",
   "added sugars": "added_sugars_g",
   protein: "protein_g",
   "vitamin d": "vitamin_d_mcg",
@@ -347,37 +346,6 @@ function extractIngredientsFromListGroup(
 }
 
 function extractIngredients($: cheerio.CheerioAPI): string | null {
-  const gmList = $("#ingredients-list");
-  if (gmList.length) {
-    const items: string[] = [];
-    gmList.each((_, ul) => {
-      $(ul)
-        .children("li")
-        .each((_, li) => {
-          const el = $(li);
-          const baseText = normalizeWhitespace(el.find(".list-title").first().text());
-          if (baseText) {
-            const cleaned = baseText
-              .replace(/^ingredients:\s*/i, "")
-              .replace(/^vitamins and minerals:\s*/i, "");
-            if (cleaned) items.push(cleaned);
-          }
-          const subList = el.find("ul").first();
-          if (subList.length) {
-            const subItems = subList
-              .find(".list-title")
-              .toArray()
-              .map((sub) => normalizeWhitespace($(sub).text()))
-              .filter(Boolean);
-            if (subItems.length) {
-              items.push(joinSubIngredients(subItems, false));
-            }
-          }
-        });
-    });
-    if (items.length) return items.join(", ");
-  }
-
   const smartLabelList = $("#ingredient-list");
   if (smartLabelList.length) {
     const container = smartLabelList.find("ul.list-group").first();
@@ -410,109 +378,6 @@ function extractIngredients($: cheerio.CheerioAPI): string | null {
   }
 
   return null;
-}
-
-function parseKelloggNutrition(
-  $: cheerio.CheerioAPI
-): { nutrition: ScraperNutritionData | null; servingSizeText: string | null } {
-  const container = $(".nutrition-facts__table").first();
-  if (!container.length) return { nutrition: null, servingSizeText: null };
-
-  const nutrition: ScraperNutritionData = {
-    serving_size_value: 1,
-    serving_size_unit_text: "serving",
-    serving_size_text: null,
-  };
-
-  const servingSizeText = normalizeWhitespace($(".nutrition-facts__serving-size").first().text())
-    .replace(/^serving size\s*/i, "")
-    .trim();
-  if (servingSizeText) {
-    nutrition.serving_size_text = servingSizeText;
-    const parsed = parseServingSize(servingSizeText);
-    nutrition.serving_size_value = parsed.value ?? 1;
-    nutrition.serving_size_unit_text = parsed.unit ?? "serving";
-  }
-
-  container.find("tr").each((_, row) => {
-    const $row = $(row);
-    const labelRaw = normalizeWhitespace($row.find("th").first().text());
-    const labelBase = normalizeWhitespace($row.find("th b").first().text()) || labelRaw;
-    const label = labelBase.toLowerCase();
-    const subItemText = normalizeWhitespace(
-      $row.find(".nutrition-facts__secondary-item--subitem").first().text()
-    );
-    if (!label) return;
-    const valueCells = $row.find("td, th").toArray().slice(1);
-    if (!valueCells.length) return;
-    const valueText = normalizeWhitespace($(valueCells[0]).text());
-    const dvText = valueCells.length > 1 ? normalizeWhitespace($(valueCells[1]).text()) : "";
-    if (DEBUG_SMART_LABEL) {
-      console.log(`[DEBUG] nutrition row: label="${label}" value="${valueText}"`);
-    }
-
-    if (label.startsWith("calories")) {
-      const parsed = parseNutrientAmountWithQualifier(valueText);
-      if (parsed) {
-        nutrition.calories = parsed.value;
-        if (parsed.qualifier) nutrition.calories_qualifier = parsed.qualifier;
-      }
-      return;
-    }
-
-    let col = mapNutrientToColumn(label);
-    if (label.startsWith("includes") && label.includes("added sugar")) {
-      col = "added_sugars_g";
-    }
-    if (label.startsWith("folate") && subItemText) {
-      const match = subItemText.match(/([\d.]+)\s*mcg\s*folic acid/i);
-      if (match) {
-        const folicAcidVal = parseFloat(match[1]);
-        if (!Number.isNaN(folicAcidVal)) {
-          (nutrition as unknown as Record<string, number>).folic_acid_mcg = folicAcidVal;
-        }
-      }
-    }
-    if (col && valueText) {
-      const parsed = parseNutrientAmountWithQualifier(valueText);
-      if (parsed) {
-        (nutrition as unknown as Record<string, number>)[col] = parsed.value;
-        if (parsed.qualifier) (nutrition as unknown as Record<string, string>)[`${col}_qualifier`] = parsed.qualifier;
-      }
-    }
-    if (dvText) {
-      const dvCol = mapNutrientToDvColumn(label);
-      if (dvCol) {
-        const dvMatch = dvText.match(/([\d.]+)/);
-        if (dvMatch) {
-          (nutrition as unknown as Record<string, number>)[dvCol] = parseFloat(dvMatch[1]);
-        }
-      }
-    }
-  });
-
-  const hasNutrients = Object.keys(nutrition).some((k) =>
-    [
-      "calories",
-      "protein_g",
-      "total_carbs_g",
-      "fiber_g",
-      "sugars_g",
-      "added_sugars_g",
-      "total_fat_g",
-      "saturated_fat_g",
-      "trans_fat_g",
-      "cholesterol_mg",
-      "sodium_mg",
-      "potassium_mg",
-      "calcium_mg",
-      "iron_mg",
-      "vitamin_d_mcg",
-      "folate_mcg",
-      "folic_acid_mcg",
-    ].includes(k)
-  );
-  return { nutrition: hasNutrients ? nutrition : null, servingSizeText: nutrition.serving_size_text ?? null };
 }
 
 function extractNutritionSection($: cheerio.CheerioAPI): cheerio.Cheerio<cheerio.Element> | null {
@@ -570,6 +435,9 @@ function parseSmartLabelNutrition($: cheerio.CheerioAPI): { nutrition: ScraperNu
       .toArray()
       .map((el) => decodeHtmlEntities(normalizeWhitespace($(el).text())) || "")
       .filter(Boolean);
+    const dvText = decodeHtmlEntities(
+      normalizeWhitespace($(row).find(".nfp__values-dvp").first().text())
+    );
     let valueText = valueCandidates.find((v) => /<|>|≈|~|\d/.test(v)) || "";
     if (!valueText) {
       valueText = decodeHtmlEntities(normalizeWhitespace($(row).find("span").last().text())) || "";
@@ -584,6 +452,15 @@ function parseSmartLabelNutrition($: cheerio.CheerioAPI): { nutrition: ScraperNu
       if (parsed) {
         (nutrition as unknown as Record<string, number>)[col] = parsed.value;
         if (parsed.qualifier) (nutrition as unknown as Record<string, string>)[`${col}_qualifier`] = parsed.qualifier;
+      }
+    }
+    if (dvText) {
+      const dvCol = mapNutrientToDvColumn(label);
+      if (dvCol) {
+        const dvMatch = dvText.match(/([\d.]+)/);
+        if (dvMatch) {
+          (nutrition as unknown as Record<string, number>)[dvCol] = parseFloat(dvMatch[1]);
+        }
       }
     }
   });
@@ -645,6 +522,15 @@ function extractNutritionFromTables($: cheerio.CheerioAPI, root: cheerio.Cheerio
       if (parsed) {
         (result as unknown as Record<string, number>)[col] = parsed.value;
         if (parsed.qualifier) (result as unknown as Record<string, string>)[`${col}_qualifier`] = parsed.qualifier;
+      }
+    }
+    if (val2) {
+      const dvCol = mapNutrientToDvColumn(label);
+      if (dvCol) {
+        const dvMatch = val2.match(/([\d.]+)/);
+        if (dvMatch) {
+          (result as unknown as Record<string, number>)[dvCol] = parseFloat(dvMatch[1]);
+        }
       }
     }
     if (label.includes("added sugars") && val1) {
@@ -796,7 +682,6 @@ async function fetchNutritionHtmlGuess(url: string, html: string): Promise<strin
 
 function extractHeaderName($: cheerio.CheerioAPI): string | null {
   const headerName =
-    $(".product-header-name").first().text() ||
     $(".product-header-name h1").first().text() ||
     $("[class*='Header__Title']").first().text() ||
     $(".Header__Title").first().text();
@@ -863,11 +748,6 @@ function stripWeightFromName(name: string | null): string | null {
   return formatted;
 }
 
-function stripCountSuffix(name: string | null): string | null {
-  if (!name) return null;
-  return name.replace(/,\s*\d+\s*[- ]?count$/i, "").trim();
-}
-
 function removeBrandPrefix(name: string | null, brand: string | null): string | null {
   if (!name || !brand) return name;
   const lowerName = name.toLowerCase();
@@ -893,12 +773,6 @@ function isOnlyWaterIngredients(text: string | null): boolean {
 }
 
 function extractImage($: cheerio.CheerioAPI, baseOrigin: string): string | null {
-  const gmImage = $(".product-image").first().attr("src");
-  if (gmImage) {
-    if (gmImage.startsWith("http")) return gmImage;
-    if (gmImage.startsWith("/")) return `${baseOrigin}${gmImage}`;
-    return gmImage;
-  }
   const og = $("meta[property='og:image']").attr("content");
   if (og) {
     if (og.startsWith("http")) return og;
@@ -910,19 +784,6 @@ function extractImage($: cheerio.CheerioAPI, baseOrigin: string): string | null 
   if (img.startsWith("http")) return img;
   if (img.startsWith("/")) return `${baseOrigin}${img}`;
   return img;
-}
-
-function isLogoImage(url: string | null): boolean {
-  if (!url) return false;
-  return /smart_label_logo/i.test(url);
-}
-
-function extractUpcFromHeader($: cheerio.CheerioAPI): string | null {
-  const upcText = normalizeWhitespace($(".upc").first().text());
-  if (!upcText) return null;
-  const match = upcText.match(/\d+/g)?.join("") ?? "";
-  if (match.length >= 12) return match.slice(-12);
-  return null;
 }
 
 async function fetchRenderedHtml(browser: Browser, url: string): Promise<string> {
@@ -996,78 +857,105 @@ async function discoverProductUrls(
   browser: Browser,
   searchUrl: string,
   maxUrls?: number
-): Promise<string[]> {
+): Promise<UrlEntry[]> {
   const page = await browser.newPage({
     userAgent:
       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
   });
   try {
-    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await page.waitForTimeout(1500);
-    const collected = new Set<string>();
+    const collected = new Map<string, UrlEntry>();
+    const isSmartLabelOrg = /smartlabel\.org\/product-search/i.test(searchUrl);
     let pageIndex = 0;
     while (true) {
       pageIndex += 1;
-      const hrefs = await page.$$eval("a[href], [data-href], [data-url]", (nodes) => {
-        const urls: string[] = [];
-        for (const node of nodes) {
-          const el = node as HTMLElement;
-          const href = (el as HTMLAnchorElement).href || el.getAttribute("data-href") || el.getAttribute("data-url");
-          if (href) urls.push(href);
+      const pageUrl = (() => {
+        if (!isSmartLabelOrg) return searchUrl;
+        const urlObj = new URL(searchUrl);
+        urlObj.searchParams.set("pn", String(pageIndex));
+        return urlObj.toString();
+      })();
+      await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      await page.waitForTimeout(1000);
+
+      const entries: UrlEntry[] = await page.$$eval("#search-results table tr", (rows) => {
+        const results: { url: string; brand?: string; name?: string }[] = [];
+        for (const row of rows) {
+          const cells = Array.from(row.querySelectorAll("td"));
+          if (cells.length < 2) continue;
+          const brand = (cells[0].textContent || "").trim();
+          const link = cells[1].querySelector("a") as HTMLAnchorElement | null;
+          const url = link?.href || "";
+          const name = (link?.textContent || cells[1].textContent || "").trim();
+          if (url) results.push({ url, brand: brand || undefined, name: name || undefined });
         }
-        return urls;
+        return results;
       });
-      const normalizedHrefs = hrefs
-        .map((href) => {
-          const trimmed = href.trim();
-          if (!trimmed) return "";
-          if (trimmed.startsWith("/Product/Index")) {
-            return `https://smartlabel.wkkellogg.com${trimmed}`;
-          }
-          if (trimmed.startsWith("Product/Index")) {
-            return `https://smartlabel.wkkellogg.com/${trimmed}`;
-          }
-          return trimmed;
-        })
-        .filter((href) => /smartlabel\.wkkellogg\.com\/product\/index\?gtin=/i.test(href));
-      for (const href of normalizedHrefs) {
-        if (!href) continue;
-        collected.add(href.split("#")[0]);
+
+      const filteredEntries = entries.filter((entry) => !!entry.url);
+      if (!filteredEntries.length) break;
+      if (DEBUG_SMART_LABEL) {
+        const sample = filteredEntries[0];
+        console.log(`[DEBUG] catalog sample url: ${sample.url ?? "(null)"}`);
+        console.log(`[DEBUG] catalog sample brand: ${sample.brand ?? "(null)"}`);
+        console.log(`[DEBUG] catalog sample name: ${sample.name ?? "(null)"}`);
+      }
+      for (const entry of filteredEntries) {
+        const normalizedUrl = entry.url.split("#")[0].replace(/\?.*$/, "");
+        if (!collected.has(normalizedUrl)) {
+          collected.set(normalizedUrl, {
+            url: normalizedUrl,
+            name: entry.name,
+            brand: entry.brand,
+          });
+        }
         if (maxUrls && collected.size >= maxUrls) {
-          return Array.from(collected);
+          return Array.from(collected.values());
         }
       }
+
       if (DEBUG_SMART_LABEL) {
         const html = await page.content();
         await fs.writeFile(`/tmp/smart-label-catalog-${pageIndex}.html`, html).catch(() => null);
       }
-      const firstHref = normalizedHrefs.find(Boolean) || "";
-      const nextButton = page.locator("#pagination-next-page");
-      const nextCount = await nextButton.count();
-      if (nextCount > 0) {
+
+      if (!isSmartLabelOrg) {
+        const hrefs = await page.$$eval("a[href]", (links) =>
+          links
+            .map((a) => (a as HTMLAnchorElement).href)
+            .filter((href) => /smartlabel\.conagra\.com/i.test(href))
+        );
+        for (const href of hrefs) {
+          if (!href) continue;
+          const normalized = href.split("#")[0].replace(/\?.*$/, "");
+          if (!collected.has(normalized)) {
+            collected.set(normalized, { url: normalized });
+          }
+          if (maxUrls && collected.size >= maxUrls) {
+            return Array.from(collected.values());
+          }
+        }
+        const firstHref = hrefs.find(Boolean) || "";
+        const nextButton = page.locator("#pagination-next-page");
         const isDisabled = await nextButton.getAttribute("aria-disabled");
         if (isDisabled === "true") break;
         await nextButton.click().catch(() => null);
-      } else {
-        const nextAlt = page.locator(".page-link", { hasText: "Next Page" });
-        const altCount = await nextAlt.count();
-        if (altCount === 0) break;
-        await nextAlt.first().click().catch(() => null);
+        await page.waitForTimeout(400);
+        await page
+          .waitForFunction(
+            (prev) => {
+              const first = document.querySelector(
+                "a[href*='smartlabel.conagra.com']"
+              ) as HTMLAnchorElement | null;
+              return !!first && first.href !== prev;
+            },
+            firstHref,
+            { timeout: 3000 }
+          )
+          .catch(() => null);
       }
-      await page.waitForTimeout(400);
-      await page
-        .waitForFunction(
-          (prev) => {
-            const first = document.querySelector("a[href*='smartlabel.wkkellogg.com']") as HTMLAnchorElement | null;
-            return !!first && first.href !== prev;
-          },
-          firstHref,
-          { timeout: 3000 }
-        )
-        .catch(() => null);
       if (maxUrls && collected.size >= maxUrls) break;
     }
-    return Array.from(collected);
+    return Array.from(collected.values());
   } finally {
     await page.close().catch(() => null);
   }
@@ -1077,7 +965,9 @@ async function fetchProduct(
   browser: Browser,
   url: string,
   reorderName: boolean,
-  stripWeight: boolean
+  stripWeight: boolean,
+  nameOverride?: string,
+  brandOverride?: string
 ): Promise<ScrapedProduct | null> {
   const fetchWithFallback = async (targetUrl: string): Promise<string> => {
     try {
@@ -1116,21 +1006,25 @@ async function fetchProduct(
   const $ = cheerio.load(html);
   const headerName = extractHeaderName($);
   const headerBrand = extractHeaderBrand($);
-  const headerUpc = extractUpcFromHeader($);
-  const rawName =
-    headerName ||
-    extractName($);
+  const fallbackName = headerName
+    ? null
+    : (() => {
+        const candidate = extractName($);
+        if (!candidate) return null;
+        return /smart\s*label/i.test(candidate) ? null : candidate;
+      })();
+  const rawName = headerName || nameOverride || fallbackName;
   const useHeaderBrand = isLikelyBrand(headerBrand) && !!headerName;
   const derived = useHeaderBrand ? { brand: headerBrand, name: rawName } : deriveBrandAndName(rawName);
-  let brand =
+  const brand =
     ((useHeaderBrand ? headerBrand : derived.brand) ||
+      brandOverride ||
       extractBrand($) ||
       "Unknown"
     ).trim();
   const reordered = reorderName ? deriveBrandAndName(rawName) : { name: rawName };
   const baseName = headerName || (reordered.name ?? derived.name) || rawName;
   let name = baseName ? baseName.trim() : baseName;
-  name = stripCountSuffix(name);
   const preBrandName = name;
   
   if (name && brand) {
@@ -1151,67 +1045,56 @@ async function fetchProduct(
   const baseOrigin = new URL(url).origin;
   let imageUrl: string | null = extractImage($, baseOrigin);
 
-  let upcFromText = headerUpc || extractUpc(html) || extractUpc($("body").text());
+  const upcFromText = extractUpc(html) || extractUpc($("body").text());
+  const nutritionSection = extractNutritionSection($);
   let nutrition: ScraperNutritionData | null = null;
   let servingSizeText: string | null = null;
-  const kelloggNutrition = parseKelloggNutrition($);
-  nutrition = kelloggNutrition.nutrition;
-  servingSizeText = kelloggNutrition.servingSizeText;
-
-  if (!nutrition || !headerName || !headerBrand || !upcFromText || !imageUrl || isLogoImage(imageUrl)) {
-    const renderedBase = await fetchRenderedHtml(browser, url);
-    if (DEBUG_SMART_LABEL) {
-      await fs.writeFile("/tmp/smart-label-rendered.html", renderedBase).catch(() => null);
-    }
-    const $base = cheerio.load(renderedBase);
-    if (!headerName) {
-      const baseHeaderName = extractHeaderName($base);
-      if (baseHeaderName) {
-        name = stripCountSuffix(baseHeaderName);
-      }
-    }
-    if (!headerBrand) {
-      const baseBrand = extractHeaderBrand($base);
-      if (baseBrand) {
-        brand = baseBrand;
-      }
-    }
-    if (!upcFromText) {
-      upcFromText = extractUpcFromHeader($base) || extractUpc(renderedBase) || extractUpc($base("body").text());
-    }
-    if (!imageUrl || isLogoImage(imageUrl)) imageUrl = extractImage($base, baseOrigin);
+  if (nutritionSection) {
+    nutrition = extractNutritionFromTables($, nutritionSection);
+    if (nutrition?.serving_size_text) servingSizeText = nutrition.serving_size_text;
+  }
+  if (!nutrition) {
+    const fallback = extractNutritionFromText($("body").text());
+    nutrition = fallback.nutrition;
+    servingSizeText = fallback.servingSizeText;
   }
 
-  if (!nutrition || DEBUG_SMART_LABEL) {
-    const nutritionUrl = url.includes("#") ? url : `${url}#productnutrition`;
+  if (!nutrition) {
+    const nutritionUrl = url.includes("#") ? url : `${url}#nutrition`;
     const renderedNutrition = await fetchRenderedHtml(browser, nutritionUrl);
     if (DEBUG_SMART_LABEL) {
       await fs.writeFile("/tmp/smart-label-rendered-nutrition.html", renderedNutrition).catch(() => null);
     }
     const $r = cheerio.load(renderedNutrition);
-    if (!nutrition) {
-      const parsed = parseKelloggNutrition($r);
-      nutrition = parsed.nutrition;
-      servingSizeText = parsed.servingSizeText ?? servingSizeText;
-    }
     if (!name) {
       const header = extractHeaderName($r) || extractName($r);
       if (header) name = stripWeightFromName(header);
     }
     if (!imageUrl) imageUrl = extractImage($r, baseOrigin);
+    const parsedNutrition = parseSmartLabelNutrition($r);
+    nutrition = parsedNutrition.nutrition;
+    servingSizeText = parsedNutrition.servingSizeText ?? servingSizeText;
+    if (!nutrition) {
+      const section = extractNutritionSection($r);
+      nutrition = section ? extractNutritionFromTables($r, section) : null;
+      if (!nutrition) {
+        const fallback = extractNutritionFromText($r("body").text());
+        nutrition = fallback.nutrition;
+        servingSizeText = fallback.servingSizeText;
+      }
+      if (nutrition?.serving_size_text) servingSizeText = nutrition.serving_size_text;
+    }
   }
 
-  if (!ingredientsText || DEBUG_SMART_LABEL) {
+  if (!ingredientsText) {
     const ingredientsUrl = url.includes("#") ? url : `${url}#ingredients`;
     const renderedIngredients = await fetchRenderedHtml(browser, ingredientsUrl);
     if (DEBUG_SMART_LABEL) {
       await fs.writeFile("/tmp/smart-label-rendered-ingredients.html", renderedIngredients).catch(() => null);
     }
     const $r = cheerio.load(renderedIngredients);
-    if (!ingredientsText) {
-      ingredientsText = extractIngredients($r);
-      if (ingredientsText) ingredientsSource = "smartlabel-rendered";
-    }
+    ingredientsText = extractIngredients($r);
+    if (ingredientsText) ingredientsSource = "smartlabel-rendered";
     if (!imageUrl) imageUrl = extractImage($r, baseOrigin);
   }
   if (DEBUG_SMART_LABEL) {
@@ -1508,11 +1391,21 @@ async function main(): Promise<void> {
           const discovered = await discoverProductUrls(browser, entry.url, remaining);
           console.log(`[DISCOVER] Found ${discovered.length} product URLs`);
           for (const d of discovered) {
-            urls.push({
-              url: d,
-              stripWeight: entry.stripWeight !== false,
-              reorderName: typeof entry.reorderName === "boolean" ? entry.reorderName : undefined,
-            });
+            if (typeof d === "string") {
+              urls.push({
+                url: d,
+                stripWeight: entry.stripWeight !== false,
+                reorderName: typeof entry.reorderName === "boolean" ? entry.reorderName : undefined,
+              });
+            } else if (d && typeof d === "object") {
+              urls.push({
+                url: d.url,
+                stripWeight: entry.stripWeight !== false,
+                reorderName: typeof entry.reorderName === "boolean" ? entry.reorderName : undefined,
+                name: d.name,
+                brand: d.brand,
+              });
+            }
           }
         } catch (err) {
           console.error(`[DISCOVER] Failed ${entry.url}:`, err);
@@ -1523,7 +1416,10 @@ async function main(): Promise<void> {
     }
   }
 
-  const deduped = new Map<string, { url: string; stripWeight: boolean; reorderName?: boolean }>();
+  const deduped = new Map<
+    string,
+    { url: string; stripWeight: boolean; reorderName?: boolean; name?: string; brand?: string }
+  >();
   for (const u of urls) {
     if (typeof u === "string") {
       if (!deduped.has(u)) deduped.set(u, { url: u, stripWeight: true, reorderName: undefined });
@@ -1533,6 +1429,8 @@ async function main(): Promise<void> {
           url: u.url,
           stripWeight: u.stripWeight !== false,
           reorderName: typeof u.reorderName === "boolean" ? u.reorderName : undefined,
+          name: u.name,
+          brand: u.brand,
         });
       }
     }
@@ -1558,7 +1456,14 @@ async function main(): Promise<void> {
       if (!u) break;
       const target = typeof u === "string" ? { url: u, stripWeight: true } : u;
       const reorder = typeof target.reorderName === "boolean" ? target.reorderName : effectiveReorder;
-      const product = await fetchProduct(browser, target.url, reorder, target.stripWeight);
+      const product = await fetchProduct(
+        browser,
+        target.url,
+        reorder,
+        target.stripWeight,
+        target.name,
+        target.brand
+      );
       if (!product) continue;
       if (!product.name || !product.ingredientsText || !product.upc12) continue;
       valid.push(product);
