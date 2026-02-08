@@ -151,6 +151,8 @@ const NUTRIENT_COLUMN_MAP: Record<string, string> = {
 
 function mapNutrientToColumn(name: string): string | null {
   const lower = name.toLowerCase().trim();
+  if (lower.includes("polyunsaturated")) return "polyunsaturated_fat_g";
+  if (lower.includes("monounsaturated")) return "monounsaturated_fat_g";
   if (lower.includes("added sugars")) return "added_sugars_g";
   if (lower.includes("total sugars")) return "sugars_g";
   if (lower.includes("folic acid")) return "folic_acid_mcg";
