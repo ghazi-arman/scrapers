@@ -163,6 +163,18 @@ const NUTRIENT_COLUMN_MAP: Record<string, string> = {
   "vitamin c": "vitamin_c_mg",
   "vitamin e": "vitamin_e_mg",
   "vitamin k": "vitamin_k_mcg",
+  thiamin: "thiamin_mg",
+  riboflavin: "riboflavin_mg",
+  niacin: "niacin_mg",
+  "vitamin b6": "vitamin_b6_mg",
+  folate: "folate_mcg",
+  "folic acid": "folic_acid_mcg",
+  "vitamin b12": "vitamin_b12_mcg",
+  biotin: "biotin_mcg",
+  "pantothenic acid": "pantothenic_acid_mg",
+  magnesium: "magnesium_mg",
+  phosphorus: "phosphorus_mg",
+  zinc: "zinc_mg",
 };
 
 function mapNutrientToColumn(name: string): string | null {
