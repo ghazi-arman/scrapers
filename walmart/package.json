@@ -1,0 +1,34 @@
+{
+  "name": "walmart-product-scraper",
+  "version": "1.0.0",
+  "description": "Scrapes Walmart.com product pages for ingredients, nutrition, images, and UPCs",
+  "type": "module",
+  "scripts": {
+    "scrape": "npx tsx scrape.ts --config ./config.json",
+    "scrape:url": "npx tsx scrape.ts --url",
+    "scrape:local": "npx tsx scrape.ts --config ./config.json --local",
+    "scrape:local:limit": "npx tsx scrape.ts --config ./config.json --local --limit 5"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/client-s3": "^3.0.0",
+    "@aws-sdk/client-ssm": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0",
+    "axios": "^1.6.0",
+    "cheerio": "^1.0.0-rc.12",
+    "p-limit": "^4.0.0",
+    "pg": "^8.11.5",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/pg": "^8.11.10",
+    "@types/uuid": "^9.0.0",
+    "dotenv": "^16.4.5",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
