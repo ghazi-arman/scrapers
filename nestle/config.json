@@ -1,6 +1,66 @@
 {
   "searchUrls": [
     {
+      "url": "https://www.goodnes.com/vital-pursuit/products/all/",
+      "brand": "Vital Pursuit"
+    },
+    {
+      "url": "https://www.goodnes.com/tombstone/products/all/",
+      "brand": "Tombstone"
+    },
+    {
+      "url": "https://www.goodnes.com/seattlesbest/products/",
+      "brand": "Seattle's Best"
+    },
+    {
+      "url": "https://www.goodnes.com/nesquik/products/",
+      "brand": "Nesquik"
+    },
+    {
+      "url": "https://www.goodnes.com/mings/products/",
+      "brand": "Ming's"
+    },
+    {
+      "url": "https://www.goodnes.com/maison-perrier/products/all/",
+      "brand": "Maison Perrier"  
+    },
+    {
+      "url": "https://www.goodnes.com/hot-pockets/products/all/",
+      "brand": "Hot Pockets"
+    },
+    {
+      "url": "https://www.goodnes.com/abuelita/products/",
+      "brand": "Abuelita"
+    },
+    {
+      "url": "https://www.goodnes.com/milo/products/",
+      "brand": "Milo"
+    },
+    {
+      "url": "https://www.goodnes.com/maggi/products/all/",
+      "brand": "Maggi"
+    },
+    {
+      "url": "https://www.goodnes.com/lean-cuisine/products/all/",
+      "brand": "Lean Cuisine"
+    },
+    {
+      "url": "https://www.goodnes.com/la-lechera/products/",
+      "brand": "La Lechera"
+    },
+    {
+      "url": "https://www.goodnes.com/jacks/products/",
+      "brand": "Jack's"
+    },
+    {
+      "url": "https://www.goodnes.com/digiorno/products/all/",
+      "brand": "DiGiorno"
+    },
+    {
+      "url": "https://www.goodnes.com/coffeemate/products/all/",
+      "brand": "Coffee-Mate"
+    },
+    {
       "url": "https://www.goodnes.com/cpk-frozen/products/all/",
       "brand": "California Pizza Kitchen"
     },

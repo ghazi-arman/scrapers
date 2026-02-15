@@ -25,7 +25,7 @@ const SCRAPER_JOB_STATUS_TABLE_NAME = process.env.SCRAPER_JOB_STATUS_TABLE_NAME;
 const API_BASE_URL = process.env.API_BASE_URL || "https://it7rdy3qbh.execute-api.us-west-2.amazonaws.com";
 const API_KEYS_PARAMETER_NAME = process.env.API_KEYS_PARAMETER_NAME || "/tummi/api-keys";
 let DEBUG_NESTLE = false;
-const NESTLE_HEADLESS = process.env.NESTLE_HEADLESS !== "0";
+let NESTLE_HEADLESS = process.env.NESTLE_HEADLESS !== "0";
 
 let serviceTokenCache: string | null = null;
 
@@ -78,7 +78,8 @@ function parseAmountWithQualifier(raw: string): { value: number | null; qualifie
   if (!raw) return {value: null};
   if (parseNutrientAmountWithQualifier) {
     const parsed = parseNutrientAmountWithQualifier(raw);
-    return {value: parsed?.value ?? null, qualifier: parsed?.qualifier ?? null, unit: parsed?.unit ?? null};
+    const unitMatch = raw.match(/([a-zA-Zµ]+)\b/);
+    return {value: parsed?.value ?? null, qualifier: parsed?.qualifier ?? null, unit: unitMatch?.[1] ?? null};
   }
   const m = raw.match(/([<>~])?\s*([\d.]+)\s*([a-zA-Z]+)?/);
   if (!m) return {value: null};
@@ -91,7 +92,7 @@ function mapNutrient(label: string): { field?: keyof ScraperNutritionData; dvFie
   if (l.startsWith("saturated fat")) return {field: "saturated_fat_g"};
   if (l.startsWith("trans fat")) return {field: "trans_fat_g"};
   if (l.startsWith("polyunsaturated fat")) return {field: "polyunsaturated_fat_g"};
-  if (l.startsWith("monounsaturated fat")) return {field: "monounsaturated_fat_g"};
+  if (l.startsWith("monounsaturated fat") || l.startsWith("mononsaturated fat")) return {field: "monounsaturated_fat_g"};
   if (l.startsWith("cholesterol")) return {field: "cholesterol_mg"};
   if (l.startsWith("sodium")) return {field: "sodium_mg"};
   if (l.startsWith("total carbohydrate") || l.startsWith("total carbohydrates")) return {field: "total_carbs_g"};
@@ -115,117 +116,197 @@ function parseNutrition($: cheerio.CheerioAPI): ScraperNutritionData | null {
       : $(".nutritionalFactsWrapper").first();
   if (!section.length) return null;
 
-  const nutrition: ScraperNutritionData = {
-    serving_size_value: 1,
-    serving_size_unit_text: "serving",
-    serving_size_text: null,
-  };
+  const parseSection = (root: cheerio.Cheerio<cheerio.Element>): ScraperNutritionData | null => {
+    const nutrition: ScraperNutritionData = {
+      serving_size_value: 1,
+      serving_size_unit_text: "serving",
+      serving_size_text: null,
+    };
 
-  if (section.is(".nutritionalFactsWrapper")) {
-    const servingSizeRow = section.find(".topSection .flexRow").filter((_, el) => {
-      return /serving size/i.test(cleanText($(el).text()));
-    });
-    if (servingSizeRow.length) {
-      const text = cleanText(servingSizeRow.last().text()).replace(/serving size/i, "").trim();
-      nutrition.serving_size_text = text || null;
-      const parsed = parseServingSize(text || null);
-      if (parsed.value != null) nutrition.serving_size_value = parsed.value;
-      if (parsed.unit) nutrition.serving_size_unit_text = parsed.unit;
-    }
+    if (root.is(".nutritionalFactsWrapper")) {
+      const servingSizeRow = root.find(".topSection .flexRow").filter((_, el) => {
+        return /serving size/i.test(cleanText($(el).text()));
+      });
+      if (servingSizeRow.length) {
+        const text = cleanText(servingSizeRow.last().text()).replace(/serving size/i, "").trim();
+        nutrition.serving_size_text = text || null;
+        const parsed = parseServingSize(text || null);
+        if (parsed.value != null) nutrition.serving_size_value = parsed.value;
+        if (parsed.unit) nutrition.serving_size_unit_text = parsed.unit;
+      }
+      if (DEBUG_NESTLE) {
+        console.log(`[DEBUG] nutrition serving size text: ${nutrition.serving_size_text ?? "(null)"}`);
+      }
 
-    const caloriesText = cleanText(section.find(".topSection .boxed span").last().text());
-    if (caloriesText) {
-      const n = caloriesText.match(/\d+/);
-      if (n) nutrition.calories = Number(n[0]);
-    }
+      let caloriesText = cleanText(root.find(".topSection .boxed span").last().text());
+      const perServingRow = root
+        .find(".topSection .boxed div")
+        .filter((_, el) => /amount per serving/i.test(cleanText($(el).text())))
+        .first();
+      if (perServingRow.length) {
+        const candidate = cleanText(perServingRow.find("span").last().text());
+        if (candidate) caloriesText = candidate;
+      }
+      if (caloriesText) {
+        const n = caloriesText.match(/\d+/);
+        if (n) nutrition.calories = Number(n[0]);
+      }
+      if (DEBUG_NESTLE) {
+        console.log(`[DEBUG] nutrition calories text: ${caloriesText || "(null)"}`);
+      }
 
-    section.find("table.nutritionFactsTable tbody tr").each((_, row) => {
-      const cells = $(row).find("td");
-      if (cells.length < 2) return;
-      const leftText = cleanText($(cells[0]).text());
-      const amountText = cleanText($(cells[1]).text());
-      const dvText = cleanText($(cells[2]).text());
-      if (!leftText) return;
+      root.find("table.nutritionFactsTable tbody tr").each((_, row) => {
+        const cells = $(row).find("td");
+        if (cells.length < 2) return;
+        const leftText = cleanText($(cells[0]).text());
+        const amountText = cleanText($(cells[1]).text());
+        const dvText = cleanText($(cells[2]).text());
+        if (!leftText) return;
 
-      const addedMatch = leftText.match(/incl\.?\s*added\s*sugars?/i);
-      if (addedMatch) {
-        const parsed = parseAmountWithQualifier(amountText);
+      const addedMatch = leftText.match(/incl\.?\s*(?:[<>~]?[\d.]+\s*(?:mcg|mg|g|iu|niu)?)?\s*added\s*sugars?/i);
+      const hasAddedSugars = /added\s*sugars?/i.test(leftText);
+      if (addedMatch || hasAddedSugars) {
+        let parsed = parseAmountWithQualifier(amountText);
+        if (parsed.value == null) {
+          const amountMatch = leftText.match(/incl\.?\s*([<>~]?[\d.]+\s*(?:mcg|mg|g|iu|niu)?)\s*added\s*sugars?/i);
+          if (amountMatch?.[1]) {
+            parsed = parseAmountWithQualifier(amountMatch[1]);
+          }
+        }
         if (parsed.value != null) nutrition.added_sugars_g = parsed.value;
+        if (parsed.qualifier) nutrition.added_sugars_g_qualifier = parsed.qualifier;
+        if (DEBUG_NESTLE) {
+          console.log(
+            `[DEBUG] added sugars row: label="${leftText}" amount="${amountText}" dv="${dvText}" value="${nutrition.added_sugars_g ?? "(null)"}" qualifier="${nutrition.added_sugars_g_qualifier ?? "(null)"}"`
+          );
+        }
         const dv = dvText.match(/(\d+)%/);
         if (dv) nutrition.added_sugars_dv_pct = Number(dv[1]);
         return;
       }
 
-      const { field, dvField } = mapNutrient(leftText);
-      if (!field && !dvField) return;
+        const { field, dvField } = mapNutrient(leftText);
+        if (!field && !dvField) return;
 
-      if (amountText) {
-        const parsed = parseAmountWithQualifier(amountText);
+        if (amountText) {
+          const parsed = parseAmountWithQualifier(amountText);
+          const unit = parsed.unit?.toLowerCase() ?? null;
+          const amountLower = amountText.toLowerCase();
+          const isVitaminAIU =
+            field === "vitamin_a_mcg" && (unit === "iu" || unit === "niu" || amountLower.includes("iu"));
+          if (parsed.value != null && !isVitaminAIU) (nutrition as any)[field as string] = parsed.value;
+          if (parsed.qualifier && !isVitaminAIU) (nutrition as any)[`${String(field)}_qualifier`] = parsed.qualifier;
+        }
+
+        const dv = dvText.match(/(\d+)%/);
+        if (dv && dvField) (nutrition as any)[dvField as string] = Number(dv[1]);
+      });
+    } else {
+      const servingSizeRow = root.find(".meta .flexRow").filter((_, el) => {
+        return /serving size/i.test(cleanText($(el).text()));
+      });
+      if (servingSizeRow.length) {
+        const text = cleanText(servingSizeRow.last().text()).replace(/serving size/i, "").trim();
+        nutrition.serving_size_text = text || null;
+        const parsed = parseServingSize(text || null);
+        if (parsed.value != null) nutrition.serving_size_value = parsed.value;
+        if (parsed.unit) nutrition.serving_size_unit_text = parsed.unit;
+      }
+
+      const caloriesText = cleanText(root.find(".meta .flexRow strong").last().text());
+      if (caloriesText) {
+        const n = caloriesText.match(/\d+/);
+        if (n) nutrition.calories = Number(n[0]);
+      }
+
+      root.find("table.nutritionFactsTable tbody tr").each((_, row) => {
+        const cells = $(row).find("td");
+        if (cells.length < 1) return;
+        const leftText = cleanText($(cells[0]).text());
+        const dvText = cleanText($(cells[1]).text());
+        if (!leftText) return;
+
+        if (/added\s*sugars?/i.test(leftText)) {
+          const amountMatch = leftText.match(/incl\.?\s*([<>~]?[\d.]+\s*(?:mcg|mg|g|iu|niu)?)\s*added\s*sugars?/i);
+          if (amountMatch?.[1]) {
+            const parsed = parseAmountWithQualifier(amountMatch[1]);
+            if (parsed.value != null) nutrition.added_sugars_g = parsed.value;
+            if (parsed.qualifier) nutrition.added_sugars_g_qualifier = parsed.qualifier;
+          }
+          const dv = dvText.match(/(\d+)%/);
+          if (dv) nutrition.added_sugars_dv_pct = Number(dv[1]);
+          if (DEBUG_NESTLE) {
+            console.log(
+              `[DEBUG] added sugars row: label="${leftText}" dv="${dvText}" value="${nutrition.added_sugars_g ?? "(null)"}" qualifier="${nutrition.added_sugars_g_qualifier ?? "(null)"}"`
+            );
+          }
+          return;
+        }
+
+        const m = leftText.match(/^(.+?)\s*([<>~]?[\d.]+\s*(?:mcg|mg|g|iu|niu)?)$/i);
+        const label = cleanText(m?.[1] ?? leftText);
+        const amountStr = cleanText(m?.[2] ?? "");
+        const { field, dvField } = mapNutrient(label);
+        if (!field && !dvField) return;
+
+        const parsed = parseAmountWithQualifier(amountStr);
         const unit = parsed.unit?.toLowerCase() ?? null;
-        const amountLower = amountText.toLowerCase();
+        const amountLower = amountStr.toLowerCase();
         const isVitaminAIU =
           field === "vitamin_a_mcg" && (unit === "iu" || unit === "niu" || amountLower.includes("iu"));
         if (parsed.value != null && !isVitaminAIU) (nutrition as any)[field as string] = parsed.value;
         if (parsed.qualifier && !isVitaminAIU) (nutrition as any)[`${String(field)}_qualifier`] = parsed.qualifier;
-      }
 
-      const dv = dvText.match(/(\d+)%/);
-      if (dv && dvField) (nutrition as any)[dvField as string] = Number(dv[1]);
-    });
-  } else {
-    const servingSizeRow = section.find(".meta .flexRow").filter((_, el) => {
-      return /serving size/i.test(cleanText($(el).text()));
-    });
-    if (servingSizeRow.length) {
-      const text = cleanText(servingSizeRow.last().text()).replace(/serving size/i, "").trim();
-      nutrition.serving_size_text = text || null;
-      const parsed = parseServingSize(text || null);
-      if (parsed.value != null) nutrition.serving_size_value = parsed.value;
-      if (parsed.unit) nutrition.serving_size_unit_text = parsed.unit;
-    }
-
-    const caloriesText = cleanText(section.find(".meta .flexRow strong").last().text());
-    if (caloriesText) {
-      const n = caloriesText.match(/\d+/);
-      if (n) nutrition.calories = Number(n[0]);
-    }
-
-    section.find("table.nutritionFactsTable tbody tr").each((_, row) => {
-      const cells = $(row).find("td");
-      if (cells.length < 1) return;
-      const leftText = cleanText($(cells[0]).text());
-      const dvText = cleanText($(cells[1]).text());
-      if (!leftText) return;
-
-      const addedMatch = leftText.match(/incl\.?\s*added\s*sugars?/i);
-      if (addedMatch) {
         const dv = dvText.match(/(\d+)%/);
-        if (dv) nutrition.added_sugars_dv_pct = Number(dv[1]);
-        return;
+        if (dv && dvField) (nutrition as any)[dvField as string] = Number(dv[1]);
+      });
+    }
+
+    const hasAny = Object.keys(nutrition).some(
+      (k) => k !== "serving_size_value" && k !== "serving_size_unit_text" && k !== "serving_size_text"
+    );
+    return hasAny ? nutrition : null;
+  };
+
+  const servingBlocks = section.find("[id^='serving-']").toArray();
+  if (servingBlocks.length > 0) {
+    let chosen: ScraperNutritionData | null = null;
+    let chosenGrams: number | null = null;
+    let chosenServingValue: number | null = null;
+    let chosenUnit: string | null = null;
+
+    for (const block of servingBlocks) {
+      const parsed = parseSection($(block));
+      if (!parsed) continue;
+      const servingText = parsed.serving_size_text ?? "";
+      const gramMatch = servingText.match(/(\d+(?:\.\d+)?)\s*g\b/i);
+      const grams = gramMatch ? parseFloat(gramMatch[1]) : null;
+      if (grams != null) {
+        if (chosenGrams == null || grams < chosenGrams) {
+          chosen = parsed;
+          chosenGrams = grams;
+          chosenServingValue = parsed.serving_size_value ?? null;
+          chosenUnit = parsed.serving_size_unit_text ?? null;
+        }
+      } else if (chosenGrams == null) {
+        const val = parsed.serving_size_value ?? null;
+        const unit = parsed.serving_size_unit_text ?? null;
+        if (chosen == null) {
+          chosen = parsed;
+          chosenServingValue = val;
+          chosenUnit = unit;
+        } else if (val != null && chosenServingValue != null && unit && chosenUnit && unit === chosenUnit && val < chosenServingValue) {
+          chosen = parsed;
+          chosenServingValue = val;
+          chosenUnit = unit;
+        }
       }
+    }
 
-      const m = leftText.match(/^(.+?)\s*([<>~]?[\d.]+\s*(?:mcg|mg|g|iu|niu)?)$/i);
-      if (!m) return;
-      const label = cleanText(m[1]);
-      const amountStr = cleanText(m[2]);
-      const { field, dvField } = mapNutrient(label);
-      if (!field && !dvField) return;
-
-      const parsed = parseAmountWithQualifier(amountStr);
-      const unit = parsed.unit?.toLowerCase() ?? null;
-      const amountLower = amountStr.toLowerCase();
-      const isVitaminAIU =
-        field === "vitamin_a_mcg" && (unit === "iu" || unit === "niu" || amountLower.includes("iu"));
-      if (parsed.value != null && !isVitaminAIU) (nutrition as any)[field as string] = parsed.value;
-      if (parsed.qualifier && !isVitaminAIU) (nutrition as any)[`${String(field)}_qualifier`] = parsed.qualifier;
-
-      const dv = dvText.match(/(\d+)%/);
-      if (dv && dvField) (nutrition as any)[dvField as string] = Number(dv[1]);
-    });
+    if (chosen) return chosen;
   }
 
-  const hasAny = Object.keys(nutrition).some((k) => k !== "serving_size_value" && k !== "serving_size_unit_text" && k !== "serving_size_text");
-  return hasAny ? nutrition : null;
+  return parseSection(section);
 }
 
 function joinSubIngredients(items: string[], hasAndOr: boolean): string {
@@ -272,7 +353,12 @@ function parseIngredientList($: cheerio.CheerioAPI, ul: cheerio.Cheerio<cheerio.
 }
 
 function extractIngredients($: cheerio.CheerioAPI): string | null {
-  const block = $(".--gdn-nutriction-facts-section-secondary-table-ingredients-body div").first();
+  const body = $(".--gdn-nutriction-facts-section-secondary-table-ingredients-body").first();
+  if (body.length) {
+    const text = cleanText(body.text());
+    return text || null;
+  }
+  const block = $(".--gdn-nutriction-facts-section-secondary-table-ingredients-body div, .--gdn-nutriction-facts-section-secondary-table-ingredients-body p").first();
   const text = cleanText(block.text());
   return text || null;
 }
@@ -511,6 +597,7 @@ function parseArgs() {
   let offset: number | undefined;
   let local = false;
   let debug = false;
+  let noHeadless = false;
   for (let i = 0; i < argv.length; i++) {
     if ((argv[i] === "--url" || argv[i] === "-u") && argv[i + 1]) {
       url = argv[i + 1];
@@ -530,9 +617,11 @@ function parseArgs() {
       local = true;
     } else if ((argv[i] === "--debug" || argv[i] === "-d")) {
       debug = true;
+    } else if (argv[i] === "--no-headless") {
+      noHeadless = true;
     }
   }
-  return { url, configPath, limit, offset, local, debug };
+  return { url, configPath, limit, offset, local, debug, noHeadless };
 }
 
 async function fetchProduct(url: string, brandOverride?: string | null) {
@@ -583,6 +672,9 @@ async function fetchProduct(url: string, brandOverride?: string | null) {
     console.log(`[DEBUG] upc: ${upc || "(null)"}`);
     console.log(`[DEBUG] image: ${imageUrl || "(null)"}`);
     console.log(`[DEBUG] ingredients length: ${ingredientsText?.length ?? 0}`);
+    if (ingredientsText) {
+      console.log(`[DEBUG] ingredients snippet: ${ingredientsText.slice(0, 140)}`);
+    }
     console.log(`[DEBUG] nutrition calories: ${nutrition?.calories ?? "(null)"}`);
   }
 
@@ -611,9 +703,10 @@ function transformToOutput(p: any, jobId: string): ScraperProductOutput {
 }
 
 async function main() {
-  const { url, configPath, limit, offset, local, debug } = parseArgs();
+  const { url, configPath, limit, offset, local, debug, noHeadless } = parseArgs();
 
   DEBUG_NESTLE = debug;
+  if (noHeadless) NESTLE_HEADLESS = false;
   if (local) {
     console.log("Running in local mode: skipping DynamoDB and S3; API submission still runs.");
   }
