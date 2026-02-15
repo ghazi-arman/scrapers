@@ -65,7 +65,7 @@ const SCRAPER_OUTPUTS_BUCKET = process.env.SCRAPER_OUTPUTS_BUCKET;
 const SCRAPER_JOB_STATUS_TABLE_NAME = process.env.SCRAPER_JOB_STATUS_TABLE_NAME;
 const API_BASE_URL = process.env.API_BASE_URL || "https://it7rdy3qbh.execute-api.us-west-2.amazonaws.com";
 const API_KEYS_PARAMETER_NAME = process.env.API_KEYS_PARAMETER_NAME || "/tummi/api-keys";
-const DEBUG_TJ = process.env.DEBUG_TJ === "1";
+let DEBUG_TJ = false;
 const TJ_HEADLESS = process.env.TJ_HEADLESS !== "0";
 const TJ_USER_DATA_DIR = process.env.TJ_USER_DATA_DIR;
 
@@ -112,22 +112,22 @@ function parseServingSize(servingSizeStr: string): { value: number; unit: string
   const fractionMatch = trimmed.match(/^(\d+)\s*\/\s*(\d+)\s*([a-zA-Z]+)/);
   if (fractionMatch) {
     const value = parseFloat(fractionMatch[1]) / parseFloat(fractionMatch[2]);
-    if (!isNaN(value)) return { value, unit: normalizeUnit(fractionMatch[3]) };
+    if (!isNaN(value)) return {value, unit: normalizeUnit(fractionMatch[3])};
   }
   const simpleMatch = trimmed.match(/^([\d.]+)\s+([a-zA-Z]+)/);
   if (simpleMatch) {
     const value = parseFloat(simpleMatch[1]);
-    if (!isNaN(value)) return { value, unit: normalizeUnit(simpleMatch[2]) };
+    if (!isNaN(value)) return {value, unit: normalizeUnit(simpleMatch[2])};
   }
   const parenMatch = trimmed.match(/\(([\d.]+)\s*([a-zA-Z]+)\)/);
   if (parenMatch) {
     const value = parseFloat(parenMatch[1]);
-    if (!isNaN(value)) return { value, unit: normalizeUnit(parenMatch[2]) };
+    if (!isNaN(value)) return {value, unit: normalizeUnit(parenMatch[2])};
   }
   const compactMatch = trimmed.match(/^([\d.]+)([a-zA-Z]+)$/);
   if (compactMatch) {
     const value = parseFloat(compactMatch[1]);
-    if (!isNaN(value)) return { value, unit: normalizeUnit(compactMatch[2]) };
+    if (!isNaN(value)) return {value, unit: normalizeUnit(compactMatch[2])};
   }
   return null;
 }
@@ -323,12 +323,10 @@ function extractNutritionFromText(text: string): TraderJoesProduct["nutrition_fa
     }
   }
 
-  return {
-    serving_size_text: servingSize ?? undefined,
+  return {serving_size_text: servingSize ?? undefined,
     servings_per_container: servingsPerContainer ?? undefined,
     calories: calories ? parseInt(calories, 10) : undefined,
-    nutrients,
-  };
+    nutrients};
 }
 
 function extractNutritionFromDom($: cheerio.CheerioAPI): TraderJoesProduct["nutrition_facts"] | null {
@@ -689,7 +687,7 @@ async function updateJobStatus(jobId: string, status: string, error: string | nu
 }
 
 /** Parse CLI: --url, --search, --config, --limit N, --local */
-function parseArgs(): { url?: string; searchUrl?: string; configPath: string; limit?: number; local: boolean } {
+function parseArgs() {
   const argv = process.argv.slice(2);
   const defaultConfig = path.resolve(__dirname, "./config.json");
   let configPath = defaultConfig;
@@ -697,6 +695,7 @@ function parseArgs(): { url?: string; searchUrl?: string; configPath: string; li
   let searchUrl: string | undefined;
   let limit: number | undefined;
   let local = false;
+  let debug = false;
   for (let i = 0; i < argv.length; i++) {
     if ((argv[i] === "--url" || argv[i] === "-u") && argv[i + 1]) {
       url = argv[i + 1];
@@ -713,9 +712,11 @@ function parseArgs(): { url?: string; searchUrl?: string; configPath: string; li
       i++;
     } else if (argv[i] === "--local") {
       local = true;
+    } else if ((argv[i] === "--debug" || argv[i] === "-d")) {
+      debug = true;
     }
   }
-  return { url, searchUrl, configPath, limit, local };
+  return { url, searchUrl, configPath, limit, local, debug };
 }
 
 function normalizeTraderJoesUrl(href: string): string | null {
@@ -799,7 +800,9 @@ async function scrapeCategoryPage(categoryUrl: string, limit?: number): Promise<
 }
 
 async function main(): Promise<void> {
-  const { url, searchUrl, configPath, limit, local } = parseArgs();
+  const { url, searchUrl, configPath, limit, local, debug } = parseArgs();
+
+  DEBUG_TJ = debug;
 
   if (local) {
     console.log("Running in local mode: skipping DynamoDB and S3; API submission still runs.");

@@ -73,7 +73,7 @@ function normalizeWhitespace(s: string): string {
 
 function parseServingSize(servingSizeText: string | null): { value: number | null; unit: string | null } {
   if (!servingSizeText || typeof servingSizeText !== "string") {
-    return { value: null, unit: null };
+    return {value: null, unit: null};
   }
   const cleaned = servingSizeText.trim().replace(/\([^)]*\)/g, "").trim();
 
@@ -84,7 +84,7 @@ function parseServingSize(servingSizeText: string | null): { value: number | nul
     const value = parseFloat(match[1]) / parseFloat(match[2]);
     let unit = match[3].trim();
     if (unit.toLowerCase() === "crackers") unit = "cracker";
-    return { value, unit };
+    return {value, unit};
   }
 
   match = cleaned.match(
@@ -95,13 +95,13 @@ function parseServingSize(servingSizeText: string | null): { value: number | nul
     const value = parseFloat(match[1]);
     let unit = (match[2] || "g").trim();
     if (unit.toLowerCase() === "crackers") unit = "cracker";
-    return { value, unit };
+    return {value, unit};
   }
 
   const numMatch = cleaned.match(/^(\d+(?:\.\d+)?)/);
-  if (numMatch) return { value: parseFloat(numMatch[1]), unit: "serving" };
+  if (numMatch) return {value: parseFloat(numMatch[1]), unit: "serving"};
 
-  return { value: null, unit: null };
+  return {value: null, unit: null};
 }
 
 
@@ -173,7 +173,7 @@ function transformNutritionToDb(nutrition: Nutrition | null): ScraperNutritionDa
 
   for (const n of nutrition.nutrients || []) {
     const col = mapNutrientToColumn(n.name);
-    if (process.env.DEBUG_TARGET === "1") {
+    if (DEBUG_TARGET) {
       console.log(`[DEBUG] nutrition row: label="${n.name}" amount="${n.amount}" mapped="${col ?? "(none)"}"`);
     }
     if (col) {
@@ -254,12 +254,10 @@ function findNutritionInNextData(obj: unknown): Nutrition | null {
         }
       }
     }
-    return {
-      servingSize: typeof servingSize === "string" ? servingSize : null,
+    return {servingSize: typeof servingSize === "string" ? servingSize : null,
       servingsPerContainer: typeof o.servingsPerContainer === "string" ? (o.servingsPerContainer as string) : null,
       calories: calories != null ? String(calories) : null,
-      nutrients,
-    };
+      nutrients};
   }
 
   for (const v of Object.values(o)) {
@@ -284,7 +282,7 @@ function findPreloadedQueries(obj: unknown): Record<string, unknown> | null {
   return null;
 }
 
-const DEBUG_PDP = process.env.DEBUG_TARGET_PDP === "1";
+let DEBUG_PDP = false;
 
 type ExtractResult = {
   name?: string;
@@ -617,7 +615,7 @@ function parseNutritionFromLabelInfoDom($: cheerio.CheerioAPI): Nutrition | null
   }
 
   if (!servingSize && !calories && nutrients.length === 0) return null;
-  return { servingSize, servingsPerContainer, calories, nutrients };
+  return {servingSize, servingsPerContainer, calories, nutrients};
 }
 
 /**
@@ -817,8 +815,7 @@ async function scrapeProductDetail(
     if (apiResult?.name && (apiResult.ingredients || apiResult.nutrition)) {
       if (DEBUG_PDP) console.log("[DEBUG] api-first: using redsky result, skipping DOM");
       const now = new Date().toISOString();
-      return {
-        brand: brandOverride || extractBrandFromName(apiResult.name) || "Unknown",
+      return {brand: brandOverride || extractBrandFromName(apiResult.name) || "Unknown",
         source: SOURCE,
         productUrl,
         name: normalizeProductName(apiResult.name),
@@ -828,8 +825,7 @@ async function scrapeProductDetail(
         imageUrl: addImageParams(apiResult.imageUrl ?? null),
         scrapedAt: now,
         sourceCreatedAt: null,
-        sourceLastUpdatedAt: null,
-      };
+        sourceLastUpdatedAt: null};
     }
 
     if (DEBUG_PDP) console.log("[DEBUG] api-first: falling back to DOM/response capture");
@@ -967,8 +963,7 @@ async function scrapeProductDetail(
 
     const now = new Date().toISOString();
 
-    return {
-      brand: brandOverride || extractBrandFromName(name) || "Unknown",
+    return {brand: brandOverride || extractBrandFromName(name) || "Unknown",
       source: SOURCE,
       productUrl,
       name,
@@ -978,8 +973,7 @@ async function scrapeProductDetail(
       imageUrl: imageUrlWithParams,
       scrapedAt: now,
       sourceCreatedAt: null,
-      sourceLastUpdatedAt: null,
-    };
+      sourceLastUpdatedAt: null};
   } finally {
     await page.close().catch(() => null);
   }
@@ -1104,8 +1098,7 @@ function transformToOutput(p: ScrapedProduct): ScraperProductOutput {
     ? parseServingSize(p.nutrition.servingSize)
     : { value: null, unit: null };
 
-  return {
-    product_name: p.name || "",
+  return {product_name: p.name || "",
     brand: p.brand,
     upc: p.upc12 || undefined,
     ingredients_text: p.ingredients || "",
@@ -1117,8 +1110,7 @@ function transformToOutput(p: ScrapedProduct): ScraperProductOutput {
     source_created_at: p.sourceCreatedAt || now,
     source_last_updated_at: p.sourceLastUpdatedAt || now,
     image_url: p.imageUrl || undefined,
-    nutrition: transformNutritionToDb(p.nutrition) || undefined,
-  };
+    nutrition: transformNutritionToDb(p.nutrition) || undefined};
 }
 
 async function getServiceToken(): Promise<string> {
@@ -1195,12 +1187,13 @@ async function updateJobStatus(jobId: string, status: string, error: string | nu
   );
 }
 
-function parseArgs(): { url?: string; configPath?: string; limit?: number; local: boolean } {
+function parseArgs() {
   const argv = process.argv.slice(2);
   let url: string | undefined;
   let configPath: string | undefined;
   let limit: number | undefined;
   let local = false;
+  let debug = false;
 
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--url" || argv[i] === "-u") {
@@ -1215,14 +1208,18 @@ function parseArgs(): { url?: string; configPath?: string; limit?: number; local
       i++;
     } else if (argv[i] === "--local") {
       local = true;
+    } else if ((argv[i] === "--debug" || argv[i] === "-d")) {
+      debug = true;
     }
   }
 
-  return { url, configPath, limit, local };
+  return { url, configPath, limit, local, debug };
 }
 
 async function main(): Promise<void> {
-  const { url, configPath, limit, local } = parseArgs();
+  const { url, configPath, limit, local, debug } = parseArgs();
+
+  DEBUG_PDP = debug;
 
   type UrlWithBrand = { url: string; brand?: string };
   let targets: UrlWithBrand[] = [];

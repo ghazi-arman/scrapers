@@ -94,7 +94,7 @@ function sha256(input: string): string {
  */
 function parseServingSize(servingSizeText: string | null): { value: number | null; unit: string | null } {
   if (!servingSizeText || typeof servingSizeText !== 'string') {
-    return { value: null, unit: null };
+    return {value: null, unit: null};
   }
 
   // Clean the text - remove parentheses content and extra whitespace
@@ -118,7 +118,7 @@ function parseServingSize(servingSizeText: string | null): { value: number | nul
     else if (unit.toLowerCase() === 'servings') unit = 'serving';
     else unit = unit.charAt(0).toUpperCase() + unit.slice(1).toLowerCase();
     
-    return { value, unit };
+    return {value, unit};
   }
   
   // Pattern 2: "1 Tbsp" or "8 fl oz" (with space, whole number or decimal)
@@ -133,7 +133,7 @@ function parseServingSize(servingSizeText: string | null): { value: number | nul
   if (!match) {
     const numMatch = cleaned.match(/^(\d+(?:\.\d+)?)/);
     if (numMatch) {
-      return { value: parseFloat(numMatch[1]), unit: 'serving' };
+      return {value: parseFloat(numMatch[1]), unit: 'serving'};
     }
   }
   
@@ -150,11 +150,11 @@ function parseServingSize(servingSizeText: string | null): { value: number | nul
     else if (unit.toLowerCase() === 'servings') unit = 'serving';
     else unit = unit.charAt(0).toUpperCase() + unit.slice(1).toLowerCase();
     
-    return { value, unit };
+    return {value, unit};
   }
 
   console.log(`Warning: Could not parse serving size: "${servingSizeText}"`);
-  return { value: null, unit: null };
+  return {value: null, unit: null};
 }
 
 
@@ -268,14 +268,12 @@ function extractSourceDates($: cheerio.CheerioAPI): { createdAt: string | null; 
       
       // Recursively search for createdAt and updatedAt fields
       const findDates = (obj: any): { createdAt: string | null; updatedAt: string | null } => {
-        if (!obj || typeof obj !== 'object') return { createdAt: null, updatedAt: null };
+        if (!obj || typeof obj !== 'object') return {createdAt: null, updatedAt: null};
         
         // Check if this object has both createdAt and updatedAt
         if (obj.createdAt && obj.updatedAt) {
-          return {
-            createdAt: typeof obj.createdAt === 'string' ? obj.createdAt : null,
-            updatedAt: typeof obj.updatedAt === 'string' ? obj.updatedAt : null,
-          };
+          return {createdAt: typeof obj.createdAt === 'string' ? obj.createdAt : null,
+            updatedAt: typeof obj.updatedAt === 'string' ? obj.updatedAt : null};
         }
         
         // Recursively search nested objects/arrays
@@ -287,7 +285,7 @@ function extractSourceDates($: cheerio.CheerioAPI): { createdAt: string | null; 
             }
           }
         }
-        return { createdAt: null, updatedAt: null };
+        return {createdAt: null, updatedAt: null};
       };
       
       return findDates(nextData);
@@ -296,7 +294,7 @@ function extractSourceDates($: cheerio.CheerioAPI): { createdAt: string | null; 
     // Ignore parsing errors
   }
   
-  return { createdAt: null, updatedAt: null };
+  return {createdAt: null, updatedAt: null};
 }
 
 /**
@@ -452,8 +450,7 @@ function transformProductToApiRequest(product: ScrapedProduct): ScraperProductOu
   // Transform nutrition data to database format
   const nutrition = transformNutritionToDbFormat(product.nutrition);
   
-  return {
-    product_name: product.name || '',
+  return {product_name: product.name || '',
     brand: product.brand,
     upc: product.upc12 || undefined,
     ingredients_text: product.ingredients || '',
@@ -465,8 +462,7 @@ function transformProductToApiRequest(product: ScrapedProduct): ScraperProductOu
     source_created_at: sourceCreatedAt,
     source_last_updated_at: sourceLastUpdatedAt,
     image_url: product.imageUrl || undefined,
-    nutrition: nutrition || undefined,
-  };
+    nutrition: nutrition || undefined};
 }
 
 /**
@@ -1026,11 +1022,9 @@ function parseNutrition($: cheerio.CheerioAPI): Nutrition | null {
           if (obj.items.length > 0 && obj.items[0]?.fields?.externalId) {
             const externalId = obj.items[0].fields.externalId;
             if (externalId.includes('NUTRSRV1')) {
-              return {
-                items: obj.items,
+              return {items: obj.items,
                 servingSize: obj.servingSize || undefined,
-                servingsPerContainer: obj.servingsPerContainer || undefined,
-              };
+                servingsPerContainer: obj.servingsPerContainer || undefined};
             }
           }
         }
@@ -1041,11 +1035,9 @@ function parseNutrition($: cheerio.CheerioAPI): Nutrition | null {
           if (obj.fields.items.length > 0 && obj.fields.items[0]?.fields?.externalId) {
             const externalId = obj.fields.items[0].fields.externalId;
             if (externalId.includes('NUTRSRV1')) {
-              return {
-                items: obj.fields.items,
+              return {items: obj.fields.items,
                 servingSize: obj.servingSize || obj.fields.servingSize || undefined,
-                servingsPerContainer: obj.servingsPerContainer || obj.fields.servingsPerContainer || undefined,
-              };
+                servingsPerContainer: obj.servingsPerContainer || obj.fields.servingsPerContainer || undefined};
             }
           }
         }
@@ -1055,7 +1047,7 @@ function parseNutrition($: cheerio.CheerioAPI): Nutrition | null {
           if (obj.length > 0 && obj[0]?.fields?.externalId) {
             const externalId = obj[0].fields.externalId;
             if (externalId.includes('NUTRSRV1')) {
-              return { items: obj };
+              return {items: obj};
             }
           }
           // Also recursively search within array elements
@@ -1229,13 +1221,11 @@ function parseNutrition($: cheerio.CheerioAPI): Nutrition | null {
     }
   }
 
-  return {
-    servingSize: servingSize ? normalizeWhitespace(servingSize) : null,
+  return {servingSize: servingSize ? normalizeWhitespace(servingSize) : null,
     servingsPerContainer: servingsPerContainer ? normalizeWhitespace(servingsPerContainer) : null,
     calories,
     nutrients,
-    rawText,
-  };
+    rawText};
 }
 
 async function scrapeListing(browser: Browser, brandCfg: BrandConfig): Promise<string[]> {
@@ -1508,7 +1498,7 @@ async function main(): Promise<void> {
     const transformedProducts = validProducts.map((product) => {
       const apiRequest = transformProductToApiRequest(product);
       // Add job_id for S3 backup (scraper job ID, not product review job ID)
-      return { ...apiRequest, scraper_job_id: jobId };
+      return {...apiRequest, scraper_job_id: jobId};
     });
 
     // Upload results to S3 (skip when running locally). S3: PutObject of products.json to scraper-outputs bucket.

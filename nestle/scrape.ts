@@ -24,7 +24,7 @@ const SCRAPER_OUTPUTS_BUCKET = process.env.SCRAPER_OUTPUTS_BUCKET;
 const SCRAPER_JOB_STATUS_TABLE_NAME = process.env.SCRAPER_JOB_STATUS_TABLE_NAME;
 const API_BASE_URL = process.env.API_BASE_URL || "https://it7rdy3qbh.execute-api.us-west-2.amazonaws.com";
 const API_KEYS_PARAMETER_NAME = process.env.API_KEYS_PARAMETER_NAME || "/tummi/api-keys";
-const DEBUG_NESTLE = process.env.DEBUG_NESTLE === "1";
+let DEBUG_NESTLE = false;
 const NESTLE_HEADLESS = process.env.NESTLE_HEADLESS !== "0";
 
 let serviceTokenCache: string | null = null;
@@ -60,51 +60,51 @@ function parseServingSize(servingSizeText: string | null): {
   value: number | null;
   unit: string | null;
 } {
-  if (!servingSizeText) return { value: null, unit: null };
+  if (!servingSizeText) return {value: null, unit: null};
   const cleaned = servingSizeText.replace(/\([^)]*\)/g, "").trim();
   const m1 = cleaned.match(/^(\d+\s*\/\s*\d+)\s*([a-zA-Z]+)/);
   if (m1) {
     const frac = m1[1].split("/").map((v) => parseFloat(v.trim()));
     if (frac.length === 2 && frac[1] !== 0) {
-      return { value: frac[0] / frac[1], unit: m1[2].toLowerCase() };
+      return {value: frac[0] / frac[1], unit: m1[2].toLowerCase()};
     }
   }
   const m2 = cleaned.match(/^(\d+(?:\.\d+)?)\s*([a-zA-Z]+)/);
-  if (m2) return { value: parseFloat(m2[1]), unit: m2[2].toLowerCase() };
-  return { value: null, unit: null };
+  if (m2) return {value: parseFloat(m2[1]), unit: m2[2].toLowerCase()};
+  return {value: null, unit: null};
 }
 
 function parseAmountWithQualifier(raw: string): { value: number | null; qualifier?: string | null; unit?: string | null } {
-  if (!raw) return { value: null };
+  if (!raw) return {value: null};
   if (parseNutrientAmountWithQualifier) {
     const parsed = parseNutrientAmountWithQualifier(raw);
-    return { value: parsed?.value ?? null, qualifier: parsed?.qualifier ?? null, unit: parsed?.unit ?? null };
+    return {value: parsed?.value ?? null, qualifier: parsed?.qualifier ?? null, unit: parsed?.unit ?? null};
   }
   const m = raw.match(/([<>~])?\s*([\d.]+)\s*([a-zA-Z]+)?/);
-  if (!m) return { value: null };
-  return { value: parseFloat(m[2]), qualifier: m[1] ?? null, unit: m[3] ?? null };
+  if (!m) return {value: null};
+  return {value: parseFloat(m[2]), qualifier: m[1] ?? null, unit: m[3] ?? null};
 }
 
 function mapNutrient(label: string): { field?: keyof ScraperNutritionData; dvField?: keyof ScraperNutritionData } {
   const l = label.toLowerCase().trim();
-  if (l.startsWith("total fat")) return { field: "total_fat_g" };
-  if (l.startsWith("saturated fat")) return { field: "saturated_fat_g" };
-  if (l.startsWith("trans fat")) return { field: "trans_fat_g" };
-  if (l.startsWith("polyunsaturated fat")) return { field: "polyunsaturated_fat_g" };
-  if (l.startsWith("monounsaturated fat")) return { field: "monounsaturated_fat_g" };
-  if (l.startsWith("cholesterol")) return { field: "cholesterol_mg" };
-  if (l.startsWith("sodium")) return { field: "sodium_mg" };
-  if (l.startsWith("total carbohydrate") || l.startsWith("total carbohydrates")) return { field: "total_carbs_g" };
-  if (l.startsWith("dietary fiber")) return { field: "fiber_g" };
-  if (l.startsWith("total sugars")) return { field: "sugars_g" };
-  if (l.startsWith("added sugars") || l.startsWith("includes")) return { field: "added_sugars_g" };
-  if (l.startsWith("protein")) return { field: "protein_g" };
-  if (l.startsWith("vitamin d")) return { field: "vitamin_d_mcg", dvField: "vitamin_d_dv_pct" };
-  if (l.startsWith("calcium")) return { field: "calcium_mg", dvField: "calcium_dv_pct" };
-  if (l.startsWith("iron")) return { field: "iron_mg", dvField: "iron_dv_pct" };
-  if (l.startsWith("potassium")) return { field: "potassium_mg", dvField: "potassium_dv_pct" };
-  if (l.startsWith("vitamin a")) return { field: "vitamin_a_mcg", dvField: "vitamin_a_dv_pct" };
-  if (l.startsWith("vitamin c")) return { field: "vitamin_c_mg", dvField: "vitamin_c_dv_pct" };
+  if (l.startsWith("total fat")) return {field: "total_fat_g"};
+  if (l.startsWith("saturated fat")) return {field: "saturated_fat_g"};
+  if (l.startsWith("trans fat")) return {field: "trans_fat_g"};
+  if (l.startsWith("polyunsaturated fat")) return {field: "polyunsaturated_fat_g"};
+  if (l.startsWith("monounsaturated fat")) return {field: "monounsaturated_fat_g"};
+  if (l.startsWith("cholesterol")) return {field: "cholesterol_mg"};
+  if (l.startsWith("sodium")) return {field: "sodium_mg"};
+  if (l.startsWith("total carbohydrate") || l.startsWith("total carbohydrates")) return {field: "total_carbs_g"};
+  if (l.startsWith("dietary fiber")) return {field: "fiber_g"};
+  if (l.startsWith("total sugars")) return {field: "sugars_g"};
+  if (l.startsWith("added sugars") || l.startsWith("includes")) return {field: "added_sugars_g"};
+  if (l.startsWith("protein")) return {field: "protein_g"};
+  if (l.startsWith("vitamin d")) return {field: "vitamin_d_mcg", dvField: "vitamin_d_dv_pct"};
+  if (l.startsWith("calcium")) return {field: "calcium_mg", dvField: "calcium_dv_pct"};
+  if (l.startsWith("iron")) return {field: "iron_mg", dvField: "iron_dv_pct"};
+  if (l.startsWith("potassium")) return {field: "potassium_mg", dvField: "potassium_dv_pct"};
+  if (l.startsWith("vitamin a")) return {field: "vitamin_a_mcg", dvField: "vitamin_a_dv_pct"};
+  if (l.startsWith("vitamin c")) return {field: "vitamin_c_mg", dvField: "vitamin_c_dv_pct"};
   return {};
 }
 
@@ -369,7 +369,7 @@ function extractFromJsonLd($: cheerio.CheerioAPI): { name?: string; brand?: stri
       let image: string | undefined;
       if (typeof node.image === "string") image = node.image;
       else if (Array.isArray(node.image)) image = node.image[0];
-      return { name: name || undefined, brand: brand || undefined, image: image || undefined };
+      return {name: name || undefined, brand: brand || undefined, image: image || undefined};
     }
   }
   return {};
@@ -510,6 +510,7 @@ function parseArgs() {
   let limit: number | undefined;
   let offset: number | undefined;
   let local = false;
+  let debug = false;
   for (let i = 0; i < argv.length; i++) {
     if ((argv[i] === "--url" || argv[i] === "-u") && argv[i + 1]) {
       url = argv[i + 1];
@@ -527,9 +528,11 @@ function parseArgs() {
       i++;
     } else if (argv[i] === "--local") {
       local = true;
+    } else if ((argv[i] === "--debug" || argv[i] === "-d")) {
+      debug = true;
     }
   }
-  return { url, configPath, limit, offset, local };
+  return { url, configPath, limit, offset, local, debug };
 }
 
 async function fetchProduct(url: string, brandOverride?: string | null) {
@@ -608,7 +611,9 @@ function transformToOutput(p: any, jobId: string): ScraperProductOutput {
 }
 
 async function main() {
-  const { url, configPath, limit, offset, local } = parseArgs();
+  const { url, configPath, limit, offset, local, debug } = parseArgs();
+
+  DEBUG_NESTLE = debug;
   if (local) {
     console.log("Running in local mode: skipping DynamoDB and S3; API submission still runs.");
   }

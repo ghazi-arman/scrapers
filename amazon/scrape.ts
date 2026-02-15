@@ -54,7 +54,7 @@ const SCRAPER_OUTPUTS_BUCKET = process.env.SCRAPER_OUTPUTS_BUCKET;
 const SCRAPER_JOB_STATUS_TABLE_NAME = process.env.SCRAPER_JOB_STATUS_TABLE_NAME;
 const API_BASE_URL = process.env.API_BASE_URL || "https://it7rdy3qbh.execute-api.us-west-2.amazonaws.com";
 const API_KEYS_PARAMETER_NAME = process.env.API_KEYS_PARAMETER_NAME || "/tummi/api-keys";
-const DEBUG_AMAZON = process.env.DEBUG_AMAZON === "1";
+let DEBUG_AMAZON = false;
 const AMAZON_HEADLESS = process.env.AMAZON_HEADLESS !== "0";
 const AMAZON_SLOWMO = process.env.AMAZON_SLOWMO ? parseInt(process.env.AMAZON_SLOWMO, 10) : undefined;
 const AMAZON_USER_DATA_DIR = process.env.AMAZON_USER_DATA_DIR;
@@ -89,7 +89,7 @@ function decodeHtmlEntities(input: string | null): string | null {
 
 function parseServingSize(servingSizeText: string | null): { value: number | null; unit: string | null } {
   if (!servingSizeText || typeof servingSizeText !== "string") {
-    return { value: null, unit: null };
+    return {value: null, unit: null};
   }
   const cleaned = servingSizeText.trim().replace(/\([^)]*\)/g, "").trim();
 
@@ -100,7 +100,7 @@ function parseServingSize(servingSizeText: string | null): { value: number | nul
     const value = parseFloat(match[1]) / parseFloat(match[2]);
     let unit = match[3].trim();
     if (unit.toLowerCase() === "crackers") unit = "cracker";
-    return { value, unit };
+    return {value, unit};
   }
 
   match = cleaned.match(
@@ -111,13 +111,13 @@ function parseServingSize(servingSizeText: string | null): { value: number | nul
     const value = parseFloat(match[1]);
     let unit = (match[2] || "g").trim();
     if (unit.toLowerCase() === "crackers") unit = "cracker";
-    return { value, unit };
+    return {value, unit};
   }
 
   const numMatch = cleaned.match(/^(\d+(?:\.\d+)?)/);
-  if (numMatch) return { value: parseFloat(numMatch[1]), unit: "serving" };
+  if (numMatch) return {value: parseFloat(numMatch[1]), unit: "serving"};
 
-  return { value: null, unit: null };
+  return {value: null, unit: null};
 }
 
 
@@ -192,7 +192,7 @@ function transformNutritionToDb(nutrition: Nutrition | null): ScraperNutritionDa
 
   for (const n of nutrition.nutrients || []) {
     const col = mapNutrientToColumn(n.name);
-    if (process.env.DEBUG_AMAZON === "1") {
+    if (DEBUG_AMAZON) {
       console.log(`[DEBUG] nutrition row: label="${n.name}" amount="${n.amount}" mapped="${col ?? "(none)"}"`);
     }
     if (col) {
@@ -435,7 +435,7 @@ function extractNutritionFromText(text: string): Nutrition | null {
   }
 
   if (!servingSize && !calories && nutrients.length === 0) return null;
-  return { servingSize, servingsPerContainer, calories, nutrients };
+  return {servingSize, servingsPerContainer, calories, nutrients};
 }
 
 function extractNutritionFromTable($: cheerio.CheerioAPI): Nutrition | null {
@@ -514,12 +514,10 @@ function extractNutritionFromNic($: cheerio.CheerioAPI): Nutrition | null {
     (nutrients && nutrients.length > 0);
   if (!hasAny) return null;
 
-  return {
-    servingSize: servingSize || null,
+  return {servingSize: servingSize || null,
     servingsPerContainer: servingsPerContainer || null,
     calories: calories || null,
-    nutrients,
-  };
+    nutrients};
 }
 
 function extractNutritionFromApiJson(data: unknown): Nutrition | null {
@@ -572,8 +570,7 @@ function extractNutritionFromApiJson(data: unknown): Nutrition | null {
         });
       }
 
-      return {
-        servingSize:
+      return {servingSize:
           (obj.servingSize as string) ||
           (obj.serving_size as string) ||
           null,
@@ -586,8 +583,7 @@ function extractNutritionFromApiJson(data: unknown): Nutrition | null {
           (obj.caloriesAmount as string) ||
           (obj.caloriesPerServing as string) ||
           (typeof obj.caloriesPerServing === "number" ? String(obj.caloriesPerServing) : null),
-        nutrients,
-      };
+        nutrients};
     }
 
     for (const value of Object.values(obj)) {
@@ -773,8 +769,7 @@ async function scrapeProductDetail(context: BrowserContext, productUrl: string, 
 
     const now = new Date().toISOString();
 
-    return {
-      brand,
+    return {brand,
       source: SOURCE,
       productUrl,
       name: cleanedName ?? name,
@@ -784,8 +779,7 @@ async function scrapeProductDetail(context: BrowserContext, productUrl: string, 
       imageUrl,
       scrapedAt: now,
       sourceCreatedAt: null,
-      sourceLastUpdatedAt: null,
-    };
+      sourceLastUpdatedAt: null};
   } finally {
     await page.close().catch(() => null);
   }
@@ -797,8 +791,7 @@ function transformToOutput(p: ScrapedProduct): ScraperProductOutput {
     ? parseServingSize(p.nutrition.servingSize)
     : { value: null, unit: null };
 
-  return {
-    product_name: p.name || "",
+  return {product_name: p.name || "",
     brand: p.brand,
     upc: p.upc12 || undefined,
     ingredients_text: p.ingredients || "",
@@ -810,8 +803,7 @@ function transformToOutput(p: ScrapedProduct): ScraperProductOutput {
     source_created_at: p.sourceCreatedAt || now,
     source_last_updated_at: p.sourceLastUpdatedAt || now,
     image_url: p.imageUrl || undefined,
-    nutrition: transformNutritionToDb(p.nutrition) || undefined,
-  };
+    nutrition: transformNutritionToDb(p.nutrition) || undefined};
 }
 
 async function getServiceToken(): Promise<string> {
@@ -888,13 +880,14 @@ async function updateJobStatus(jobId: string, status: string, error: string | nu
   );
 }
 
-function parseArgs(): { url?: string; configPath?: string; limit?: number; local: boolean } {
+function parseArgs() {
   const argv = process.argv.slice(2);
   let url: string | undefined;
   let searchUrl: string | undefined;
   let configPath: string | undefined;
   let limit: number | undefined;
   let local = false;
+  let debug = false;
 
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--url" || argv[i] === "-u") {
@@ -912,10 +905,12 @@ function parseArgs(): { url?: string; configPath?: string; limit?: number; local
       i++;
     } else if (argv[i] === "--local") {
       local = true;
+    } else if ((argv[i] === "--debug" || argv[i] === "-d")) {
+      debug = true;
     }
   }
 
-  return { url, configPath, limit, local, searchUrl };
+  return { url, configPath, limit, local, searchUrl, debug };
 }
 
 function normalizeAmazonUrl(href: string): string | null {
@@ -1018,7 +1013,9 @@ async function scrapeAislePage(context: BrowserContext, aisleUrl: string, limit?
 }
 
 async function main(): Promise<void> {
-  const { url, configPath, limit, local, searchUrl } = parseArgs();
+  const { url, configPath, limit, local, searchUrl, debug } = parseArgs();
+
+  DEBUG_AMAZON = debug;
 
   let productTargets: string[] = [];
   let searchTargets: string[] = [];

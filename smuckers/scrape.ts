@@ -249,7 +249,7 @@ function extractNutritionFromText(fullText: string): {
     nutrients[n.key] = { label: n.label, amount, dailyValue };
   }
 
-  return { servingSize, calories, nutrients };
+  return {servingSize, calories, nutrients};
 }
 
 function extractNutritionAndIngredients(url: string, html: string): ScrapedProduct {
@@ -443,7 +443,7 @@ async function uploadToS3(results: ScraperProductOutput[], jobId: string, runDat
  */
 function parseServingSize(servingSizeText: string | null): { value: number | null; unit: string | null } {
   if (!servingSizeText || typeof servingSizeText !== "string") {
-    return { value: null, unit: null };
+    return {value: null, unit: null};
   }
 
   // Match pattern like "1 Tbsp (20g)" or "2 Tbsp" or "1 cup"
@@ -462,10 +462,10 @@ function parseServingSize(servingSizeText: string | null): { value: number | nul
     else if (unit.toLowerCase() === "fl oz" || unit.toLowerCase() === "floz") unit = "fl oz";
     else unit = unit.charAt(0).toUpperCase() + unit.slice(1).toLowerCase();
 
-    return { value, unit };
+    return {value, unit};
   }
 
-  return { value: null, unit: null };
+  return {value: null, unit: null};
 }
 
 
@@ -758,7 +758,7 @@ async function main(): Promise<void> {
     const transformedProducts = validProducts.map((product) => {
       const apiRequest = transformProductToApiRequest(product);
       // Add job_id for S3 backup (scraper job ID, not product review job ID)
-      return { ...apiRequest, scraper_job_id: jobId };
+      return {...apiRequest, scraper_job_id: jobId};
     });
 
     // Upload results to S3 (skip when running locally). S3: PutObject of products.json to scraper-outputs bucket.

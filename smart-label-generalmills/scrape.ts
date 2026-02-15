@@ -40,7 +40,7 @@ const SCRAPER_OUTPUTS_BUCKET = process.env.SCRAPER_OUTPUTS_BUCKET;
 const SCRAPER_JOB_STATUS_TABLE_NAME = process.env.SCRAPER_JOB_STATUS_TABLE_NAME;
 const API_BASE_URL = process.env.API_BASE_URL || "https://it7rdy3qbh.execute-api.us-west-2.amazonaws.com";
 const API_KEYS_PARAMETER_NAME = process.env.API_KEYS_PARAMETER_NAME || "/tummi/api-keys";
-const DEBUG_SMART_LABEL = process.env.DEBUG_SMART_LABEL === "1";
+let DEBUG_SMART_LABEL = false;
 const SMART_LABEL_HEADLESS = process.env.SMART_LABEL_HEADLESS !== "0";
 
 const s3Client = new S3Client({});
@@ -72,7 +72,7 @@ function parseNutrientAmountWithQualifier(amount: string | null): ParsedNutrient
   if (!match) return null;
   const value = parseFloat(match[1]);
   if (Number.isNaN(value)) return null;
-  return { value, qualifier };
+  return {value, qualifier};
 }
 
 async function getServiceToken(): Promise<string> {
@@ -115,16 +115,16 @@ function extractUpc(text: string): string | null {
 }
 
 function parseServingSize(servingSizeText: string | null): { value: number | null; unit: string | null } {
-  if (!servingSizeText || typeof servingSizeText !== "string") return { value: null, unit: null };
+  if (!servingSizeText || typeof servingSizeText !== "string") return {value: null, unit: null};
   const cleaned = servingSizeText.trim().replace(/\([^)]*\)/g, "").trim();
   let match = cleaned.match(/^(\d+)\s*\/\s*(\d+)\s*([a-zA-Z]+)/);
   if (match) {
     const value = parseFloat(match[1]) / parseFloat(match[2]);
-    return { value, unit: match[3].toLowerCase() };
+    return {value, unit: match[3].toLowerCase()};
   }
   match = cleaned.match(/^(\d+(?:\.\d+)?)\s*([a-zA-Z]+)/);
-  if (match) return { value: parseFloat(match[1]), unit: match[2].toLowerCase() };
-  return { value: null, unit: null };
+  if (match) return {value: parseFloat(match[1]), unit: match[2].toLowerCase()};
+  return {value: null, unit: null};
 }
 
 const NUTRIENT_COLUMN_MAP: Record<string, string> = {
@@ -213,9 +213,9 @@ function cleanAndOrText(text: string): { text: string; andOr: boolean } {
   const trimmed = text.trim();
   const andOrMatch = /^and\/?or\s+/i;
   if (andOrMatch.test(trimmed)) {
-    return { text: trimmed.replace(andOrMatch, "").trim(), andOr: true };
+    return {text: trimmed.replace(andOrMatch, "").trim(), andOr: true};
   }
-  return { text: trimmed, andOr: false };
+  return {text: trimmed, andOr: false};
 }
 
 function joinSubIngredients(items: string[], hasAndOr: boolean): string {
@@ -420,7 +420,7 @@ function extractNutritionSection($: cheerio.CheerioAPI): cheerio.Cheerio<cheerio
 
 function parseSmartLabelNutrition($: cheerio.CheerioAPI): { nutrition: ScraperNutritionData | null; servingSizeText: string | null } {
   const section = $(".nutrition-section").first();
-  if (!section.length) return { nutrition: null, servingSizeText: null };
+  if (!section.length) return {nutrition: null, servingSizeText: null};
 
   const nutrition: ScraperNutritionData = {
     serving_size_value: 1,
@@ -502,7 +502,7 @@ function parseSmartLabelNutrition($: cheerio.CheerioAPI): { nutrition: ScraperNu
       "folic_acid_mcg",
     ].includes(k)
   );
-  return { nutrition: hasNutrients ? nutrition : null, servingSizeText: nutrition.serving_size_text ?? null };
+  return {nutrition: hasNutrients ? nutrition : null, servingSizeText: nutrition.serving_size_text ?? null};
 }
 
 function extractNutritionFromTables($: cheerio.CheerioAPI, root: cheerio.Cheerio<cheerio.Element>): ScraperNutritionData | null {
@@ -621,7 +621,7 @@ function extractNutritionFromTables($: cheerio.CheerioAPI, root: cheerio.Cheerio
 
 function extractNutritionFromText(text: string): { nutrition: ScraperNutritionData | null; servingSizeText: string | null } {
   const lower = text.toLowerCase();
-  if (!/nutrition facts|serving size|calories/.test(lower)) return { nutrition: null, servingSizeText: null };
+  if (!/nutrition facts|serving size|calories/.test(lower)) return {nutrition: null, servingSizeText: null};
 
   const servingSize = text.match(/serving size\s*:?\\s*([^\n\r]+)/i)?.[1]?.trim() ?? null;
   const calories = text.match(/calories\s*:?\\s*(\d+)/i)?.[1] ?? null;
@@ -638,7 +638,7 @@ function extractNutritionFromText(text: string): { nutrition: ScraperNutritionDa
   }
   if (calories) nutrition.calories = parseInt(calories, 10);
 
-  return { nutrition, servingSizeText: servingSize };
+  return {nutrition, servingSizeText: servingSize};
 }
 
 function extractSmartLabelGuid(html: string): string | null {
@@ -732,13 +732,13 @@ function extractBrand($: cheerio.CheerioAPI): string | null {
 }
 
 function deriveBrandAndName(name: string | null): { brand: string | null; name: string | null } {
-  if (!name) return { brand: null, name: null };
+  if (!name) return {brand: null, name: null};
   const parts = name.split(",").map((p) => p.trim()).filter(Boolean);
-  if (parts.length <= 1) return { brand: null, name };
+  if (parts.length <= 1) return {brand: null, name};
   const brand = parts[0];
   const rest = parts.slice(1);
   const reordered = rest.length >= 2 ? [rest[rest.length - 1], ...rest.slice(0, -1)] : rest;
-  return { brand, name: reordered.join(", ") };
+  return {brand, name: reordered.join(", ")};
 }
 
 function stripWeightFromName(name: string | null): string | null {
@@ -822,7 +822,7 @@ function parseGeneralMillsNutrition(
   $: cheerio.CheerioAPI
 ): { nutrition: ScraperNutritionData | null; servingSizeText: string | null } {
   const container = $(".nutritional-container").first();
-  if (!container.length) return { nutrition: null, servingSizeText: null };
+  if (!container.length) return {nutrition: null, servingSizeText: null};
 
   const nutrition: ScraperNutritionData = {
     serving_size_value: 1,
@@ -900,7 +900,7 @@ function parseGeneralMillsNutrition(
       "folic_acid_mcg",
     ].includes(k)
   );
-  return { nutrition: hasNutrients ? nutrition : null, servingSizeText: nutrition.serving_size_text ?? null };
+  return {nutrition: hasNutrients ? nutrition : null, servingSizeText: nutrition.serving_size_text ?? null};
 }
 
 async function fetchRenderedHtml(browser: Browser, url: string): Promise<string> {
@@ -1239,8 +1239,7 @@ async function fetchProduct(
 
 function transformToOutput(p: ScrapedProduct, jobId: string): ScraperProductOutput {
   const now = new Date().toISOString();
-  return {
-    product_name: p.name || "",
+  return {product_name: p.name || "",
     brand: p.brand,
     upc: p.upc12 || undefined,
     upcs: p.upcs && p.upcs.length ? p.upcs : p.upc12 ? [p.upc12] : undefined,
@@ -1254,8 +1253,7 @@ function transformToOutput(p: ScrapedProduct, jobId: string): ScraperProductOutp
     serving_size_value: p.nutrition?.serving_size_value ?? undefined,
     serving_size_unit: p.nutrition?.serving_size_unit_text ?? undefined,
     nutrition: p.nutrition ?? undefined,
-    scraper_job_id: jobId,
-  };
+    scraper_job_id: jobId};
 }
 
 function normalizeMergeText(value: string | null | undefined): string {
@@ -1355,14 +1353,7 @@ async function updateJobStatus(jobId: string, status: string, error: string | nu
   );
 }
 
-function parseArgs(): {
-  url?: string;
-  configPath: string;
-  limit?: number;
-  offset?: number;
-  local: boolean;
-  reorderName: boolean;
-} {
+function parseArgs() {
   const argv = process.argv.slice(2);
   const defaultConfig = path.resolve(__dirname, "./config.json");
   let configPath = defaultConfig;
@@ -1370,6 +1361,7 @@ function parseArgs(): {
   let limit: number | undefined;
   let offset: number | undefined;
   let local = false;
+  let debug = false;
   let reorderName = false;
 
   for (let i = 0; i < argv.length; i++) {
@@ -1389,16 +1381,20 @@ function parseArgs(): {
       i++;
     } else if (argv[i] === "--local") {
       local = true;
+    } else if ((argv[i] === "--debug" || argv[i] === "-d")) {
+      debug = true;
     } else if (argv[i] === "--reorder-name") {
       reorderName = true;
     }
   }
 
-  return { url, configPath, limit, offset, local, reorderName };
+  return { url, configPath, limit, offset, local, reorderName, debug };
 }
 
 async function main(): Promise<void> {
-  const { url, configPath, limit, offset, local, reorderName } = parseArgs();
+  const { url, configPath, limit, offset, local, reorderName, debug } = parseArgs();
+
+  DEBUG_SMART_LABEL = debug;
 
   if (local) {
     console.log("Running in local mode: skipping DynamoDB and S3; API submission still runs.");

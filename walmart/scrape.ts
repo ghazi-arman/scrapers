@@ -29,7 +29,7 @@ const SCRAPER_OUTPUTS_BUCKET = process.env.SCRAPER_OUTPUTS_BUCKET;
 const SCRAPER_JOB_STATUS_TABLE_NAME = process.env.SCRAPER_JOB_STATUS_TABLE_NAME;
 const API_BASE_URL = process.env.API_BASE_URL || "https://it7rdy3qbh.execute-api.us-west-2.amazonaws.com";
 const API_KEYS_PARAMETER_NAME = process.env.API_KEYS_PARAMETER_NAME || "/tummi/api-keys";
-const DEBUG_WM = process.env.DEBUG_WALMART === "1";
+let DEBUG_WM = false;
 const SCRAPEDO_TOKEN = process.env.SCRAPEDO_TOKEN || "";
 const SUBMIT_NUTRITION_PARSE_JOB_URL =
   process.env.SUBMIT_NUTRITION_PARSE_JOB_URL ||
@@ -158,7 +158,7 @@ function extractProductIdFromUrl(url: string): string | null {
 
 function parseServingSize(servingSizeText: string | null): { value: number | null; unit: string | null } {
   if (!servingSizeText || typeof servingSizeText !== "string") {
-    return { value: null, unit: null };
+    return {value: null, unit: null};
   }
   const cleaned = servingSizeText.trim().replace(/\([^)]*\)/g, "").trim();
 
@@ -169,7 +169,7 @@ function parseServingSize(servingSizeText: string | null): { value: number | nul
     const value = parseFloat(match[1]) / parseFloat(match[2]);
     let unit = match[3].trim();
     if (unit.toLowerCase() === "crackers") unit = "cracker";
-    return { value, unit };
+    return {value, unit};
   }
 
   match = cleaned.match(
@@ -180,13 +180,13 @@ function parseServingSize(servingSizeText: string | null): { value: number | nul
     const value = parseFloat(match[1]);
     let unit = (match[2] || "g").trim();
     if (unit.toLowerCase() === "crackers") unit = "cracker";
-    return { value, unit };
+    return {value, unit};
   }
 
   const numMatch = cleaned.match(/^(\d+(?:\.\d+)?)/);
-  if (numMatch) return { value: parseFloat(numMatch[1]), unit: "serving" };
+  if (numMatch) return {value: parseFloat(numMatch[1]), unit: "serving"};
 
-  return { value: null, unit: null };
+  return {value: null, unit: null};
 }
 
 function extractJsonLd($: cheerio.CheerioAPI): any[] {
@@ -386,7 +386,7 @@ function extractNameBrandFromNextData(nextData: any): { name: string | null; bra
   const ctx = extractItemContext(nextData);
   const name = cleanText(ctx?.name || null);
   const brand = cleanText(ctx?.brand || null);
-  return { name, brand };
+  return {name, brand};
 }
 
 function extractImageFromNextData(nextData: any): string | null {
@@ -469,10 +469,10 @@ function getPackSizeVariantList(nextData: any): any[] | null {
 
 function shouldSkipForPackSize(nextData: any): { skip: boolean; reason?: string } {
   const list = getPackSizeVariantList(nextData);
-  if (!list || list.length === 0) return { skip: false };
+  if (!list || list.length === 0) return {skip: false};
   const selectedIndex = list.findIndex((v) => v && v.selected === true);
-  if (selectedIndex <= 0) return { skip: false };
-  return { skip: true, reason: "not smallest pack size variant selected" };
+  if (selectedIndex <= 0) return {skip: false};
+  return {skip: true, reason: "not smallest pack size variant selected"};
 }
 
 function normalizeProductName(name: string | null): string | null {
@@ -563,12 +563,10 @@ function nutritionFromJsonLd(nutrition: any): Nutrition | null {
   add("Total Sugars", nutrition.sugarContent);
   add("Protein", nutrition.proteinContent);
 
-  return {
-    servingSize: servingSize || null,
+  return {servingSize: servingSize || null,
     servingsPerContainer: null,
     calories: calories || null,
-    nutrients,
-  };
+    nutrients};
 }
 
 function normalizeNutrientName(n: string): string {
@@ -602,7 +600,7 @@ function nutritionFromProductData(product: any): Nutrition | null {
   }
 
   if (!servingSize && !calories && nutrients.length === 0) return null;
-  return { servingSize: servingSize || null, servingsPerContainer, calories: calories || null, nutrients };
+  return {servingSize: servingSize || null, servingsPerContainer, calories: calories || null, nutrients};
 }
 
 function transformNutritionToDb(nutrition: Nutrition | null): ScraperNutritionData | null {
@@ -654,8 +652,7 @@ function transformToOutput(p: ScrapedProduct): ScraperProductOutput {
         : { value: null, unit: null };
   const servingText = p.nutritionData?.serving_size_text || p.nutrition?.servingSize || undefined;
 
-  return {
-    product_name: p.name || "",
+  return {product_name: p.name || "",
     brand: p.brand || "",
     upc: p.upc12 || undefined,
     upcs: p.upcs && p.upcs.length ? p.upcs : undefined,
@@ -668,8 +665,7 @@ function transformToOutput(p: ScrapedProduct): ScraperProductOutput {
     source_created_at: p.sourceCreatedAt || now,
     source_last_updated_at: p.sourceLastUpdatedAt || now,
     image_url: p.imageUrl || undefined,
-    nutrition: p.nutritionData || transformNutritionToDb(p.nutrition) || undefined,
-  };
+    nutrition: p.nutritionData || transformNutritionToDb(p.nutrition) || undefined};
 }
 
 function normalizeMergeText(value: string | null | undefined): string {
@@ -1215,20 +1211,14 @@ async function updateJobStatus(jobId: string, status: string, error: string | nu
   );
 }
 
-function parseArgs(): {
-  url?: string;
-  configPath: string;
-  limit?: number;
-  local: boolean;
-  concurrency: number;
-  offset: number;
-} {
+function parseArgs() {
   const argv = process.argv.slice(2);
   const defaultConfig = path.resolve(__dirname, "./config.json");
   let configPath = defaultConfig;
   let url: string | undefined;
   let limit: number | undefined;
   let local = false;
+  let debug = false;
   let concurrency = 5;
   let offset = 0;
 
@@ -1253,14 +1243,18 @@ function parseArgs(): {
       i++;
     } else if (argv[i] === "--local") {
       local = true;
+    } else if ((argv[i] === "--debug" || argv[i] === "-d")) {
+      debug = true;
     }
   }
 
-  return { url, configPath, limit, local, concurrency, offset };
+  return { url, configPath, limit, local, concurrency, offset, debug };
 }
 
 async function main(): Promise<void> {
-  const { url, configPath, limit, local, concurrency, offset } = parseArgs();
+  const { url, configPath, limit, local, concurrency, offset, debug } = parseArgs();
+
+  DEBUG_WM = debug;
 
   if (local) {
     console.log("Running in local mode: skipping DynamoDB and S3; API submission still runs.");
@@ -1377,7 +1371,7 @@ async function main(): Promise<void> {
   const merged = mergeProducts(valid);
   const results: ScraperProductOutput[] = merged.map((p) => {
     const output = transformToOutput(p);
-    return { ...output, scraper_job_id: jobId };
+    return {...output, scraper_job_id: jobId};
   });
 
   if (!local) {

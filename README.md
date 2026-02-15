@@ -61,14 +61,12 @@ You can run any scraper **locally** (no AWS/API) and optionally cap how many pro
 
 ### Debug, Headless, and Config
 
-**Debug mode** – Enable verbose logging for each scraper:
+**Debug mode** – Enable verbose logging for any scraper with `--debug`:
 
-| Scraper | Debug env var | Example |
-|---------|---------------|---------|
-| Amazon | `DEBUG_AMAZON=1` | `DEBUG_AMAZON=1 npx tsx scrape.ts --config config.json --local --limit 1` |
-| Trader Joe's | `DEBUG_TJ=1` | `DEBUG_TJ=1 npx tsx scrape.ts --config config.json --local --limit 1` |
-| Vons | `DEBUG_VONS=1` | `DEBUG_VONS=1 npx tsx scrape.ts --config config.json --local --limit 1` |
-| Target | `DEBUG_TARGET_PDP=1` | `DEBUG_TARGET_PDP=1 npx tsx scrape.ts --config config.json --local --limit 1` |
+Example:
+```bash
+npx tsx scrape.ts --config config.json --local --limit 1 --debug
+```
 
 **Headless** – By default, Playwright runs headless (no browser window). To see the browser window:
 
@@ -107,8 +105,8 @@ This opens the Playwright Inspector so you can step through actions and inspect 
 
 ```bash
 cd scrapers/amazon
-DEBUG_AMAZON=1 AMAZON_HEADLESS=0 AMAZON_SLOWMO=300 \
-  npx tsx scrape.ts --config config.json --local --limit 1
+AMAZON_HEADLESS=0 AMAZON_SLOWMO=300 \
+  npx tsx scrape.ts --config config.json --local --limit 1 --debug
 ```
 
 **Target scraper options:**
