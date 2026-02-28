@@ -3,7 +3,6 @@ import * as path from "path";
 import { fileURLToPath } from "url";
 import axios from "axios";
 import * as cheerio from "cheerio";
-import pLimit from "p-limit";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
@@ -12,6 +11,9 @@ import { v4 as uuidv4 } from "uuid";
 import type { ScraperProductOutput, ScraperNutritionData } from "../shared-types";
 import * as nutritionUtils from "../nutrition-utils";
 import { chromium } from "playwright";
+import * as servingSizeUtils from "../serving-size-utils";
+import * as productIdUtils from "../product-id-utils";
+import * as nameUtils from "../name-utils";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -19,12 +21,21 @@ const __dirname = path.dirname(__filename);
 const parseNutrientAmountWithQualifier =
   (nutritionUtils as any).parseNutrientAmountWithQualifier ??
   (nutritionUtils as any).default?.parseNutrientAmountWithQualifier;
+const parseServingSizeFromText =
+  (servingSizeUtils as any).parseServingSizeFromText ??
+  (servingSizeUtils as any).default?.parseServingSizeFromText;
+const generateDeterministicProductId =
+  (productIdUtils as any).generateDeterministicProductId ??
+  (productIdUtils as any).default?.generateDeterministicProductId;
+const cleanProductName =
+  (nameUtils as any).cleanProductName ?? (nameUtils as any).default?.cleanProductName;
 
 const SOURCE = "tyson.com";
 const SCRAPER_NAME = process.env.JOB_NAME || "tyson";
 const SCRAPER_OUTPUTS_BUCKET = process.env.SCRAPER_OUTPUTS_BUCKET;
 const SCRAPER_JOB_STATUS_TABLE_NAME = process.env.SCRAPER_JOB_STATUS_TABLE_NAME;
-const API_BASE_URL = process.env.API_BASE_URL || "https://it7rdy3qbh.execute-api.us-west-2.amazonaws.com";
+const API_BASE_URL = process.env.API_BASE_URL || "https://api.mytummi.app";
+const PRODUCTS_API_URL = `${API_BASE_URL}/products`;
 const API_KEYS_PARAMETER_NAME = process.env.API_KEYS_PARAMETER_NAME || "/tummi/api-keys";
 let DEBUG_TYSON = false;
 
@@ -58,6 +69,7 @@ type ScrapedProduct = {
   name: string | null;
   brand: string | null;
   ingredients: string | null;
+  allergenStatement: string | null;
   upc12: string | null;
   nutrition: Nutrition | null;
   imageUrl: string | null;
@@ -154,35 +166,12 @@ function cleanText(s: string | null | undefined): string | null {
 }
 
 function parseServingSize(servingSizeText: string | null): { value: number | null; unit: string | null } {
-  if (!servingSizeText || typeof servingSizeText !== "string") {
-    return {value: null, unit: null};
+  if (typeof parseServingSizeFromText !== "function") {
+    throw new Error("parseServingSizeFromText import failed");
   }
-  const cleaned = servingSizeText.trim().replace(/\([^)]*\)/g, "").trim();
-
-  let match = cleaned.match(
-    /^(\d+)\/(\d+)\s+(Tbsp|tbsp|TSP|tsp|cup|cups|oz|fl\s*oz|floz|ml|g|kg|lb|lbs|serving|servings)\b/i
-  );
-  if (match) {
-    const value = parseFloat(match[1]) / parseFloat(match[2]);
-    let unit = match[3].trim();
-    return {value, unit};
-  }
-
-  match = cleaned.match(
-    /^(\d+(?:\.\d+)?)\s+(Tbsp|tbsp|TSP|tsp|cup|cups|oz|fl\s*oz|floz|ml|g|kg|lb|lbs|serving|servings)\b/i
-  );
-  if (!match) match = cleaned.match(/^(\d+(?:\.\d+)?)(g|oz|ml)\b/i);
-  if (match) {
-    const value = parseFloat(match[1]);
-    const unit = (match[2] || "g").trim();
-    return {value, unit};
-  }
-
-  const numMatch = cleaned.match(/^(\d+(?:\.\d+)?)/);
-  if (numMatch) return {value: parseFloat(numMatch[1]), unit: "serving"};
-
-  return {value: null, unit: null};
+  return parseServingSizeFromText(servingSizeText);
 }
+
 
 function extractJsonLd($: cheerio.CheerioAPI): any[] {
   const out: any[] = [];
@@ -243,6 +232,26 @@ function extractIngredientsFromHtml($: cheerio.CheerioAPI): string | null {
     if (text) return text.replace(/^ingredients:?\s*/i, "");
   }
   return null;
+}
+
+function extractAllergenFromHtml($: cheerio.CheerioAPI): string | null {
+  const selectors = [
+    "[data-testid='allergens']",
+    "[data-automation-id='allergens']",
+    "#allergens",
+    "[aria-label*='Allergen']",
+    "[id*='allergen']",
+  ];
+  for (const sel of selectors) {
+    const text = cleanText($(sel).text());
+    if (text && /(contains|may contain|allergen)/i.test(text)) return text;
+  }
+  const candidates = $("p, li, div, span")
+    .map((_, el) => cleanText($(el).text()))
+    .get()
+    .filter((t): t is string => !!t && /(?:contains|may contain|allergen)/i.test(t) && t.length <= 240);
+  const direct = candidates.find((t) => /^(contains|may contain|allergen)/i.test(t));
+  return cleanText(direct || candidates[0] || null);
 }
 
 function extractNutritionFromTable($: cheerio.CheerioAPI): Nutrition | null {
@@ -426,6 +435,7 @@ function transformToOutput(p: ScrapedProduct): ScraperProductOutput {
     brand: p.brand || "Tyson",
     upc: p.upc12 || undefined,
     ingredients_text: p.ingredients || "",
+    allergen_statement: p.allergenStatement || undefined,
     serving_size_value: serving.value ?? undefined,
     serving_size_unit: serving.unit ?? undefined,
     serving_size_text: p.nutrition?.servingSize ?? undefined,
@@ -506,7 +516,14 @@ async function scrapeProduct(url: string): Promise<ScrapedProduct | null> {
   const jsonLd = extractJsonLd($);
   const jsonLdProduct = jsonLd.find((o) => o && (o["@type"] === "Product" || o["@type"] === "ProductGroup")) || null;
 
-  const name = cleanText(jsonLdProduct?.name || $("h1").first().text() || null);
+  const rawName = cleanText(jsonLdProduct?.name || $("h1").first().text() || null);
+  const name = cleanProductName(rawName, {
+    decodeHtml: true,
+    stripTrailingWeight: true,
+    stripTrailingCount: true,
+    stripTrailingDashSize: true,
+    stripParenAtEnd: true,
+  });
   const brand = cleanText(
     (typeof jsonLdProduct?.brand === "string" ? jsonLdProduct.brand : jsonLdProduct?.brand?.name) ||
       $("[data-testid='brand']").text() ||
@@ -515,6 +532,8 @@ async function scrapeProduct(url: string): Promise<ScrapedProduct | null> {
   const ingredients =
     cleanText(jsonLdProduct?.ingredients || jsonLdProduct?.ingredientStatement || null) ||
     extractIngredientsFromHtml($);
+  const allergenStatement =
+    cleanText(jsonLdProduct?.allergenStatement || jsonLdProduct?.allergens || null) || extractAllergenFromHtml($);
   const nutrition =
     extractNutritionFromTable($) ||
     nutritionFromJsonLd(jsonLdProduct?.nutrition || jsonLdProduct?.nutritionInformation || null);
@@ -530,6 +549,7 @@ async function scrapeProduct(url: string): Promise<ScrapedProduct | null> {
     console.log(`[DEBUG] name=${name ?? "(null)"}`);
     console.log(`[DEBUG] brand=${brand ?? "(null)"}`);
     console.log(`[DEBUG] ingredients=${ingredients ?? "(null)"}`);
+    console.log(`[DEBUG] allergens=${allergenStatement ?? "(null)"}`);
     console.log(`[DEBUG] upc=${upc12 ?? "(null)"}`);
     console.log(`[DEBUG] image=${imageUrl ?? "(null)"}`);
     console.log(`[DEBUG] nutrition=${nutrition ? "yes" : "no"}`);
@@ -541,6 +561,7 @@ async function scrapeProduct(url: string): Promise<ScrapedProduct | null> {
     name,
     brand: brand || "Tyson",
     ingredients,
+    allergenStatement,
     upc12,
     nutrition,
     imageUrl: typeof imageUrl === "string" ? imageUrl : null,
@@ -558,6 +579,28 @@ async function getServiceToken(): Promise<string> {
   serviceTokenCache = param.InternalServiceToken;
   if (!serviceTokenCache) throw new Error("InternalServiceToken not found");
   return serviceTokenCache;
+}
+
+async function checkProductExists(params: {
+  name: string | null;
+  brand: string | null;
+  upc: string | null;
+}): Promise<boolean> {
+  const { name, brand, upc } = params;
+  if (!name || typeof generateDeterministicProductId !== "function") return false;
+  const productId = generateDeterministicProductId(name, brand || undefined, upc || undefined);
+  try {
+    const token = await getServiceToken();
+    const res = await axios.get(`${PRODUCTS_API_URL}/${productId}`, {
+      headers: { "X-Service-Token": token },
+      timeout: 10_000,
+    });
+    return !!res?.data;
+  } catch (err: any) {
+    if (err?.response?.status === 404) return false;
+    if (DEBUG_TYSON) console.log("[DEBUG] product exists check failed:", err?.message || err);
+    return false;
+  }
 }
 
 async function submitProductForReview(productOutput: ScraperProductOutput): Promise<boolean> {
@@ -724,51 +767,86 @@ async function main(): Promise<void> {
   }
   console.log(`Processing ${urls.length} product URLs`);
 
-  const limiter = pLimit(concurrency);
-  const products = await Promise.all(
-    urls.map((u) =>
-      limiter(async () => {
-        try {
-          return await scrapeProduct(u);
-        } catch (err) {
-          console.error(`❌ Failed ${u}:`, err);
-          return null;
-        }
-      })
-    )
-  );
-
-  const valid: ScrapedProduct[] = [];
   const results: ScraperProductOutput[] = [];
-  for (const p of products) {
-    if (!p) continue;
-    console.log(`Processing product: ${p.productUrl}`);
-    if (!p.name || !p.ingredients) {
-      console.log(`Skipping ${p.productUrl}: missing name or ingredients`);
-      continue;
+  const submitBatch: ScraperProductOutput[] = [];
+  const SUBMIT_BATCH_SIZE = 10;
+  let scrapedCount = 0;
+  let skippedCount = 0;
+  let success = 0;
+  let fail = 0;
+
+  const flushSubmitBatch = async (force: boolean) => {
+    if (!force && submitBatch.length < SUBMIT_BATCH_SIZE) return;
+    if (!submitBatch.length) return;
+    const take = force ? submitBatch.length : Math.min(SUBMIT_BATCH_SIZE, submitBatch.length);
+    const batch = submitBatch.splice(0, take);
+    console.log(`\n➡️  Submitting batch (${batch.length} items)`);
+    for (const r of batch) {
+      const { scraper_job_id: _, ...body } = r;
+      const ok = await submitProductForReview(body);
+      if (ok) success++;
+      else fail++;
     }
-    valid.push(p);
-    const output = transformToOutput(p);
-    results.push({ ...output, scraper_job_id: jobId });
-  }
+  };
+  let flushChain: Promise<void> = Promise.resolve();
+  const queueFlush = (force: boolean) => {
+    flushChain = flushChain.then(() => flushSubmitBatch(force)).catch((err) => {
+      console.error("[SUBMIT] batch flush failed:", err);
+    });
+    return flushChain;
+  };
+
+  const queue = [...urls];
+  const workerCount = Math.max(1, Math.min(concurrency, queue.length));
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (queue.length) {
+      const u = queue.shift();
+      if (!u) break;
+      let p: ScrapedProduct | null = null;
+      try {
+        p = await scrapeProduct(u);
+      } catch (err) {
+        console.error(`❌ Failed ${u}:`, err);
+        skippedCount++;
+        continue;
+      }
+      if (!p || !p.name || !p.ingredients) {
+        console.log(`[SKIP] ${u}: missing name or ingredients`);
+        skippedCount++;
+        continue;
+      }
+      const output = transformToOutput(p);
+      const exists = await checkProductExists({
+        name: output.product_name || null,
+        brand: output.brand || null,
+        upc: output.upc || output.upcs?.[0] || null,
+      });
+      if (exists) {
+        console.log(`[SKIP] ${output.product_name || "(no name)"}: already exists`);
+        skippedCount++;
+        continue;
+      }
+      scrapedCount++;
+      console.log(`[PRODUCT] OK | ${output.product_name || "(no name)"} | ${u}`);
+      const out = { ...output, scraper_job_id: jobId };
+      results.push(out);
+      submitBatch.push(out);
+      if (submitBatch.length >= SUBMIT_BATCH_SIZE) void queueFlush(false);
+    }
+  });
+  await Promise.all(workers);
+  await queueFlush(true);
+  await flushChain;
 
   if (!local) {
     await uploadToS3(results, jobId, runDateTime);
   }
 
-  console.log(`\n📤 Submitting ${results.length} products for review...`);
-  let success = 0;
-  let fail = 0;
-  for (const r of results) {
-    const { scraper_job_id: _, ...body } = r;
-    const ok = await submitProductForReview(body);
-    if (ok) success++;
-    else fail++;
-  }
+  console.log(`\nScraped ${scrapedCount} valid products (skipped ${skippedCount}) out of ${urls.length} total`);
   console.log(`\n📊 API: ${success} submitted, ${fail} failed`);
 
   if (!local && SCRAPER_JOB_STATUS_TABLE_NAME) {
-    if (valid.length === 0) {
+    if (results.length === 0) {
       await updateJobStatus(jobId, "error", "No products processed");
       process.exit(1);
     } else {

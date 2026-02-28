@@ -8,12 +8,26 @@ import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 import { v4 as uuidv4 } from "uuid";
 import type { ScraperProductOutput, ScraperNutritionData } from "../shared-types";
 import * as nutritionUtils from "../nutrition-utils";
+import * as servingSizeUtils from "../serving-size-utils";
+import * as nameUtils from "../name-utils";
+import * as productIdUtils from "../product-id-utils";
 
 const parseNutrientAmountWithQualifier =
   (nutritionUtils as any).parseNutrientAmountWithQualifier ??
   (nutritionUtils as any).default?.parseNutrientAmountWithQualifier;
+const parseServingSizeFromText =
+  (servingSizeUtils as any).parseServingSizeFromText ??
+  (servingSizeUtils as any).default?.parseServingSizeFromText;
+const cleanProductName =
+  (nameUtils as any).cleanProductName ?? (nameUtils as any).default?.cleanProductName;
+const generateDeterministicProductId =
+  (productIdUtils as any).generateDeterministicProductId ??
+  (productIdUtils as any).default?.generateDeterministicProductId;
 
-const PRODUCTS_PAGE = "https://www.smuckers.com/products";
+const PRODUCTS_PAGES = [
+  "https://www.smuckersuncrustables.com/sandwiches",
+  "https://www.smuckers.com/products",
+];
 
 // AWS clients
 const s3Client = new S3Client({});
@@ -25,8 +39,10 @@ const ssmClient = new SSMClient({});
 const SCRAPER_NAME = process.env.JOB_NAME || "smuckers";
 const SCRAPER_OUTPUTS_BUCKET = process.env.SCRAPER_OUTPUTS_BUCKET;
 const SCRAPER_JOB_STATUS_TABLE_NAME = process.env.SCRAPER_JOB_STATUS_TABLE_NAME;
-const API_BASE_URL = process.env.API_BASE_URL || "https://it7rdy3qbh.execute-api.us-west-2.amazonaws.com";
+const API_BASE_URL = process.env.API_BASE_URL || "https://api.mytummi.app";
+const PRODUCTS_API_URL = `${API_BASE_URL}/products`;
 const API_KEYS_PARAMETER_NAME = process.env.API_KEYS_PARAMETER_NAME || "/tummi/api-keys";
+let DEBUG_SMUCKERS = false;
 
 // Cache for service token
 let serviceTokenCache: string | null = null;
@@ -36,6 +52,7 @@ type ScrapedProduct = {
   name: string | null;
   image: string | null;
   ingredientsText: string | null;
+  allergenStatement: string | null;
   nutrition: {
     servingSize: string | null;
     calories: number | null;
@@ -62,6 +79,16 @@ function absUrl(base: string, href: string): string | null {
   }
 }
 
+function getBrandForProductUrl(productUrl: string): string {
+  try {
+    const host = new URL(productUrl).hostname;
+    if (host === "www.smuckersuncrustables.com") return "Smucker's Uncrustables";
+  } catch {
+    // fall back to default brand
+  }
+  return "Smucker's";
+}
+
 async function fetchHtml(url: string): Promise<string> {
   const res = await axios.get(url, {
     headers: {
@@ -74,6 +101,28 @@ async function fetchHtml(url: string): Promise<string> {
   return res.data;
 }
 
+async function checkProductExists(params: {
+  name: string | null;
+  brand: string | null;
+  upc: string | null;
+}): Promise<boolean> {
+  const { name, brand, upc } = params;
+  if (!name || typeof generateDeterministicProductId !== "function") return false;
+  const productId = generateDeterministicProductId(name, brand || undefined, upc || undefined);
+  try {
+    const token = await getServiceToken();
+    const res = await axios.get(`${PRODUCTS_API_URL}/${productId}`, {
+      headers: { "X-Service-Token": token },
+      timeout: 10_000,
+    });
+    return !!res?.data;
+  } catch (e: any) {
+    if (e?.response?.status === 404) return false;
+    if (DEBUG_SMUCKERS) console.log("[DEBUG] product exists check failed:", e?.message || e);
+    return false;
+  }
+}
+
 /**
  * ✅ FIXED: Only keep *real* Smuckers product detail URLs.
  * This prevents junk like OneTrust from being scraped.
@@ -81,6 +130,7 @@ async function fetchHtml(url: string): Promise<string> {
 function extractSmuckersProductLinks(listingUrl: string, html: string): string[] {
   const $ = cheerio.load(html);
   const out = new Set<string>();
+  const listingHost = new URL(listingUrl).hostname;
 
   $("a[href]").each((_, a) => {
     const href = $(a).attr("href");
@@ -96,35 +146,41 @@ function extractSmuckersProductLinks(listingUrl: string, html: string): string[]
       return;
     }
 
-    // ✅ Only Smuckers
-    if (u.hostname !== "www.smuckers.com") return;
+    // ✅ Only supported hosts
+    if (!["www.smuckers.com", "www.smuckersuncrustables.com"].includes(u.hostname)) return;
 
     const path = u.pathname.replace(/\/+$/, "");
     if (!path || path === "/") return;
 
-    // ✅ Exclude obvious non-product areas
-    const bannedPrefixes = [
-      "/products",
-      "/recipes",
-      "/articles",
-      "/about",
-      "/faqs",
-      "/search",
-      "/where-to-buy",
-      "/privacy",
-      "/terms",
-    ];
-    if (bannedPrefixes.some((p) => path === p || path.startsWith(p + "/"))) return;
+    if (u.hostname === "www.smuckers.com") {
+      // ✅ Exclude obvious non-product areas
+      const bannedPrefixes = [
+        "/products",
+        "/recipes",
+        "/articles",
+        "/about",
+        "/faqs",
+        "/search",
+        "/where-to-buy",
+        "/privacy",
+        "/terms",
+      ];
+      if (bannedPrefixes.some((p) => path === p || path.startsWith(p + "/"))) return;
+    } else if (u.hostname === "www.smuckersuncrustables.com") {
+      // Uncrustables product detail pages are under /sandwiches/<product-slug>
+      if (!(path.startsWith("/sandwiches/") && path !== "/sandwiches")) return;
+    }
 
     // ✅ Exclude "View All ..." category links (these are usually category landing pages)
     const linkText = cleanText($(a).text()).toLowerCase();
     if (linkText.startsWith("view all")) return;
 
-    // ✅ Heuristic: product detail pages are "deeper" than category pages.
-    // Examples on /products include /fruit-spreads/jam/strawberry-jam (3 segments),
-    // and /ice-cream-toppings/magic-shell/magic-shell-chocolate-topping (3 segments).
     const segments = path.split("/").filter(Boolean);
-    if (segments.length < 3) return;
+    if (u.hostname === "www.smuckers.com" && segments.length < 3) return;
+    if (u.hostname === "www.smuckersuncrustables.com" && segments.length < 2) return;
+
+    // Keep discovery scoped to the requested listing host.
+    if (listingHost === "www.smuckersuncrustables.com" && u.hostname !== "www.smuckersuncrustables.com") return;
 
     out.add(u.toString());
   });
@@ -255,7 +311,16 @@ function extractNutritionFromText(fullText: string): {
 function extractNutritionAndIngredients(url: string, html: string): ScrapedProduct {
   const $ = cheerio.load(html);
 
-  const name = cleanText($("h1").first().text()) || null;
+  const rawName = cleanText($("h1").first().text()) || null;
+  const name = rawName
+    ? typeof cleanProductName === "function"
+      ? cleanProductName(rawName, {
+          stripTrailingWeight: true,
+          stripTrailingCommaSize: true,
+          stripParenAtEnd: true,
+        })
+      : rawName
+    : null;
   const image = extractOgImage($, url);
 
   // Ingredients: find exact "Ingredients" label and take next nearby text block.
@@ -297,6 +362,10 @@ function extractNutritionAndIngredients(url: string, html: string): ScrapedProdu
   }
 
   const parsedNutrition = extractNutritionFromText(nutritionText);
+  const servingSizeFromDom =
+    cleanText($(".nutrition-row.serving-size .value").first().text()) ||
+    cleanText($(".nutrition-row.serving-size").first().find(".value").first().text()) ||
+    null;
 
   const nutrition = {
     servingSize: parsedNutrition.servingSize,
@@ -305,9 +374,17 @@ function extractNutritionAndIngredients(url: string, html: string): ScrapedProdu
   };
 
   const servingMatch =
-    nutritionText.match(/Serving Size\s*:? *([^\n]+)/i) ||
-    nutritionText.match(/Serving size\s*:? *([^\n]+)/i);
-  if (servingMatch) nutrition.servingSize = cleanText(servingMatch[1]);
+    nutritionText.match(
+      /Serving Size\s*:? *(.+?)(?=\bAmount Per Serving\b|\bCalories\b|\b%Daily Value\b|\bTotal Fat\b|\bIngredients\b|$)/i
+    ) ||
+    nutritionText.match(
+      /Serving size\s*:? *(.+?)(?=\bAmount Per Serving\b|\bCalories\b|\b%Daily Value\b|\bTotal Fat\b|\bIngredients\b|$)/i
+    );
+  if (servingSizeFromDom) {
+    nutrition.servingSize = servingSizeFromDom;
+  } else if (servingMatch) {
+    nutrition.servingSize = cleanText(servingMatch[1]);
+  }
 
   const calMatch =
     nutritionText.match(/Calories\s*:? *(\d+)/i) ||
@@ -378,7 +455,17 @@ function extractNutritionAndIngredients(url: string, html: string): ScrapedProdu
     if (m) upc12 = m[1];
   }
 
-  return { url, name, image, ingredientsText, nutrition, upc12 };
+  const allergenStatement = cleanText(
+    $(".nutrition-detail.nutrition-allergens .value").first().text() ||
+      $(".nutrition-allergens .value").first().text() ||
+      $("*")
+        .filter((_, el) => cleanText($(el).text()) === "Allergens")
+        .first()
+        .next()
+        .text()
+  ) || null;
+
+  return { url, name, image, ingredientsText, allergenStatement, nutrition, upc12 };
 }
 
 async function updateJobStatus(jobId: string, status: string, error: string | null = null): Promise<void> {
@@ -442,31 +529,12 @@ async function uploadToS3(results: ScraperProductOutput[], jobId: string, runDat
  * Example: "1 Tbsp (20g)" -> { value: 1, unit: "Tbsp" }
  */
 function parseServingSize(servingSizeText: string | null): { value: number | null; unit: string | null } {
-  if (!servingSizeText || typeof servingSizeText !== "string") {
-    return {value: null, unit: null};
+  if (typeof parseServingSizeFromText !== "function") {
+    throw new Error("parseServingSizeFromText import failed");
   }
-
-  // Match pattern like "1 Tbsp (20g)" or "2 Tbsp" or "1 cup"
-  // Look for number followed by unit (Tbsp, tsp, cup, etc.)
-  const match = servingSizeText.match(/^(\d+(?:\.\d+)?)\s+(Tbsp|tbsp|TSP|tsp|cup|cups|oz|fl\s*oz|ml|g|kg|lb|lbs)\b/i);
-
-  if (match) {
-    const value = parseFloat(match[1]);
-    let unit = match[2];
-
-    // Normalize unit to standard form
-    if (unit.toLowerCase() === "tbsp") unit = "Tbsp";
-    else if (unit.toLowerCase() === "tsp") unit = "tsp";
-    else if (unit.toLowerCase() === "cups") unit = "cup";
-    else if (unit.toLowerCase() === "lbs") unit = "lb";
-    else if (unit.toLowerCase() === "fl oz" || unit.toLowerCase() === "floz") unit = "fl oz";
-    else unit = unit.charAt(0).toUpperCase() + unit.slice(1).toLowerCase();
-
-    return {value, unit};
-  }
-
-  return {value: null, unit: null};
+  return parseServingSizeFromText(servingSizeText);
 }
+
 
 
 /**
@@ -600,6 +668,7 @@ async function getServiceToken(): Promise<string> {
  */
 function transformProductToApiRequest(product: ScrapedProduct): ScraperProductOutput {
   const now = new Date().toISOString();
+  const brand = getBrandForProductUrl(product.url);
 
   // Parse serving size from nutrition data
   const servingSize = product.nutrition?.servingSize ? parseServingSize(product.nutrition.servingSize) : { value: null, unit: null };
@@ -609,9 +678,10 @@ function transformProductToApiRequest(product: ScrapedProduct): ScraperProductOu
 
   return {
     product_name: product.name || "",
-    brand: "Smucker's",
+    brand,
     upc: product.upc12 || undefined,
     ingredients_text: product.ingredientsText || "",
+    allergen_statement: product.allergenStatement || undefined,
     serving_size_value: servingSize.value ?? undefined,
     serving_size_unit: servingSize.unit ?? undefined,
     serving_size_text: product.nutrition?.servingSize ?? undefined,
@@ -638,6 +708,9 @@ async function submitProductForReview(product: ScrapedProduct): Promise<boolean>
     const productOutput = transformProductToApiRequest(product);
     // Remove scraper_job_id for API submission (it's only for S3)
     const { scraper_job_id, ...requestBody } = productOutput;
+    if (DEBUG_SMUCKERS) {
+      console.log(`[DEBUG] submit body: ${JSON.stringify(requestBody, null, 2)}`);
+    }
 
     const response = await axios.post(`${API_BASE_URL}/submit-product-for-review`, requestBody, {
       headers: {
@@ -664,13 +737,14 @@ async function submitProductForReview(product: ScrapedProduct): Promise<boolean>
 }
 
 /** Parse CLI args: --concurrency N, --limit N, --local */
-function parseSmuckersArgs(): { concurrency: number; limit?: number; local: boolean } {
+function parseSmuckersArgs(): { concurrency: number; limit?: number; local: boolean; debug: boolean } {
   const argv = process.argv.slice(2);
   let concurrency = 5;
   let limit: number | undefined;
   let local = false;
+  let debug = false;
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === "--concurrency" && argv[i + 1] != null) {
+    if ((argv[i] === "--concurrency" || argv[i] === "-n") && argv[i + 1] != null) {
       const n = parseInt(argv[i + 1], 10);
       if (!isNaN(n) && n > 0) concurrency = n;
       i++;
@@ -682,13 +756,16 @@ function parseSmuckersArgs(): { concurrency: number; limit?: number; local: bool
       }
     } else if (argv[i] === "--local") {
       local = true;
+    } else if (argv[i] === "--debug" || argv[i] === "-d") {
+      debug = true;
     }
   }
-  return { concurrency, limit, local };
+  return { concurrency, limit, local, debug };
 }
 
 async function main(): Promise<void> {
-  const { concurrency, limit: productLimit, local } = parseSmuckersArgs();
+  const { concurrency, limit: productLimit, local, debug } = parseSmuckersArgs();
+  DEBUG_SMUCKERS = debug;
   const jobId = uuidv4();
   const runDateTime = new Date().toISOString().replace(/[:.]/g, "-").slice(0, -5);
 
@@ -716,12 +793,17 @@ async function main(): Promise<void> {
   }
 
   try {
-    console.log(`Fetching listing: ${PRODUCTS_PAGE}`);
-    const listingHtml = await fetchHtml(PRODUCTS_PAGE);
+    const discoveredLinks = new Set<string>();
+    for (const listingUrl of PRODUCTS_PAGES) {
+      console.log(`Fetching listing: ${listingUrl}`);
+      const listingHtml = await fetchHtml(listingUrl);
+      const links = extractSmuckersProductLinks(listingUrl, listingHtml);
+      console.log(`[DISCOVER] ${listingUrl} -> ${links.length} links`);
+      for (const link of links) discoveredLinks.add(link);
+    }
 
-    const productLinks = extractSmuckersProductLinks(PRODUCTS_PAGE, listingHtml);
-
-    console.log(`Found ${productLinks.length} Smuckers product links`);
+    const productLinks = Array.from(discoveredLinks);
+    console.log(`Found ${productLinks.length} Smuckers/Uncrustables product links`);
     console.log("Sample:", productLinks.slice(0, 10));
 
     // Apply --limit: only scrape first N product URLs
@@ -750,7 +832,20 @@ async function main(): Promise<void> {
     );
 
     // Filter out errors and products without required fields
-    const validProducts = results.filter((r) => !(r as any).error && r.name && r.ingredientsText) as ScrapedProduct[];
+    const scrapedProducts = results.filter((r) => !(r as any).error && r.name && r.ingredientsText) as ScrapedProduct[];
+    const validProducts: ScrapedProduct[] = [];
+    for (const product of scrapedProducts) {
+      const exists = await checkProductExists({
+        name: product.name,
+        brand: getBrandForProductUrl(product.url),
+        upc: product.upc12,
+      });
+      if (exists) {
+        console.log(`[SKIP] ${product.name ?? "(no name)"}: already exists`);
+        continue;
+      }
+      validProducts.push(product);
+    }
 
     console.log(`Scraped ${validProducts.length} valid products out of ${results.length} total`);
 
@@ -766,16 +861,18 @@ async function main(): Promise<void> {
       await uploadToS3(transformedProducts, jobId, runDateTime);
     }
 
-    // Submit each valid product via API (runs locally too; use AWS profile for SSM API key).
+    // Submit valid products in batches.
     console.log(`\n📤 Submitting products for review via API...`);
     let apiSuccessCount = 0;
     let apiFailureCount = 0;
-    for (const product of validProducts) {
-      const success = await submitProductForReview(product);
-      if (success) {
-        apiSuccessCount++;
-      } else {
-        apiFailureCount++;
+    const SUBMIT_BATCH_SIZE = 100;
+    for (let i = 0; i < validProducts.length; i += SUBMIT_BATCH_SIZE) {
+      const batch = validProducts.slice(i, i + SUBMIT_BATCH_SIZE);
+      console.log(`\n➡️  Submitting batch (${batch.length} items)`);
+      for (const product of batch) {
+        const success = await submitProductForReview(product);
+        if (success) apiSuccessCount++;
+        else apiFailureCount++;
       }
     }
 

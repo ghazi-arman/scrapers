@@ -7,12 +7,25 @@ import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 import { v4 as uuidv4 } from "uuid";
 import { chromium } from "playwright";
 import * as fs from "fs/promises";
+import pLimit from "p-limit";
+import * as path from "path";
 import type { ScraperProductOutput, ScraperNutritionData } from "../shared-types";
+import * as nameUtils from "../name-utils";
 import * as nutritionUtils from "../nutrition-utils";
+import * as servingSizeUtils from "../serving-size-utils";
+import * as productIdUtils from "../product-id-utils";
 
 const parseNutrientAmountWithQualifier =
   (nutritionUtils as any).parseNutrientAmountWithQualifier ??
   (nutritionUtils as any).default?.parseNutrientAmountWithQualifier;
+const cleanProductName =
+  (nameUtils as any).cleanProductName ?? (nameUtils as any).default?.cleanProductName;
+const parseServingSizeFromText =
+  (servingSizeUtils as any).parseServingSizeFromText ??
+  (servingSizeUtils as any).default?.parseServingSizeFromText;
+const generateDeterministicProductId =
+  (productIdUtils as any).generateDeterministicProductId ??
+  (productIdUtils as any).default?.generateDeterministicProductId;
 
 const s3Client = new S3Client({});
 const dynamoDbClient = new DynamoDBClient({});
@@ -22,12 +35,35 @@ const ssmClient = new SSMClient({});
 const SCRAPER_NAME = process.env.JOB_NAME || "nestle";
 const SCRAPER_OUTPUTS_BUCKET = process.env.SCRAPER_OUTPUTS_BUCKET;
 const SCRAPER_JOB_STATUS_TABLE_NAME = process.env.SCRAPER_JOB_STATUS_TABLE_NAME;
-const API_BASE_URL = process.env.API_BASE_URL || "https://it7rdy3qbh.execute-api.us-west-2.amazonaws.com";
+const API_BASE_URL = process.env.API_BASE_URL || "https://api.mytummi.app";
+const PRODUCTS_API_URL = `${API_BASE_URL}/products`;
 const API_KEYS_PARAMETER_NAME = process.env.API_KEYS_PARAMETER_NAME || "/tummi/api-keys";
 let DEBUG_NESTLE = false;
 let NESTLE_HEADLESS = process.env.NESTLE_HEADLESS !== "0";
 
 let serviceTokenCache: string | null = null;
+
+async function checkProductExists(params: {
+  name: string | null;
+  brand: string | null;
+  upc: string | null;
+}): Promise<boolean> {
+  const { name, brand, upc } = params;
+  if (!name || typeof generateDeterministicProductId !== "function") return false;
+  const productId = generateDeterministicProductId(name, brand || undefined, upc || undefined);
+  try {
+    const token = await getServiceToken();
+    const res = await axios.get(`${PRODUCTS_API_URL}/${productId}`, {
+      headers: { "X-Service-Token": token },
+      timeout: 10_000,
+    });
+    return !!res?.data;
+  } catch (e: any) {
+    if (e?.response?.status === 404) return false;
+    if (DEBUG_NESTLE) console.log("[DEBUG] product exists check failed:", e);
+    return false;
+  }
+}
 
 function cleanText(s: string | null | undefined): string {
   return (s ?? "").replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
@@ -45,33 +81,25 @@ function decodeHtmlEntities(s: string | null | undefined): string {
 }
 
 function stripWeightFromName(name: string): string {
-  return name
-    .replace(/\([^)]*\)$/g, "")
-    .replace(/\bnet\s*wt\b.*$/i, "")
-    .replace(
-      /[, ]*\b\d+(?:\.\d+)?\s*(?:oz|ounce|ounces|fl oz|fluid ounce|g|kg|lb|lbs|ml|l|ct|count|pack|pk)\b.*$/i,
-      ""
-    )
-    .replace(/\s+/g, " ")
-    .trim();
+  return (
+    cleanProductName(name, {
+      stripBrandPrefix: true,
+      stripPipe: true,
+      stripTrailingWeight: true,
+      stripTrailingCount: true,
+      stripTrailingCommaSize: true,
+      stripTrailingDashSize: true,
+      stripAfterWeight: true,
+      stripParenAtEnd: true,
+    }) || name
+  );
 }
 
-function parseServingSize(servingSizeText: string | null): {
-  value: number | null;
-  unit: string | null;
-} {
-  if (!servingSizeText) return {value: null, unit: null};
-  const cleaned = servingSizeText.replace(/\([^)]*\)/g, "").trim();
-  const m1 = cleaned.match(/^(\d+\s*\/\s*\d+)\s*([a-zA-Z]+)/);
-  if (m1) {
-    const frac = m1[1].split("/").map((v) => parseFloat(v.trim()));
-    if (frac.length === 2 && frac[1] !== 0) {
-      return {value: frac[0] / frac[1], unit: m1[2].toLowerCase()};
-    }
+function parseServingSize(servingSizeText: string | null): { value: number | null; unit: string | null } {
+  if (typeof parseServingSizeFromText !== "function") {
+    throw new Error("parseServingSizeFromText import failed");
   }
-  const m2 = cleaned.match(/^(\d+(?:\.\d+)?)\s*([a-zA-Z]+)/);
-  if (m2) return {value: parseFloat(m2[1]), unit: m2[2].toLowerCase()};
-  return {value: null, unit: null};
+  return parseServingSizeFromText(servingSizeText);
 }
 
 function parseAmountWithQualifier(raw: string): { value: number | null; qualifier?: string | null; unit?: string | null } {
@@ -363,6 +391,43 @@ function extractIngredients($: cheerio.CheerioAPI): string | null {
   return text || null;
 }
 
+function extractAllergens($: cheerio.CheerioAPI): string | null {
+  const body = $(".--gdn-nutriction-facts-section-secondary-table-allergens-body").first();
+  if (body.length) {
+    const text = cleanText(body.text());
+    return text || null;
+  }
+  const block = $(".--gdn-nutriction-facts-section-secondary-table-allergens-body div, .--gdn-nutriction-facts-section-secondary-table-allergens-body p").first();
+  const text = cleanText(block.text());
+  return text || null;
+}
+
+function splitIngredientsAndAllergens(raw: string | null): { ingredients: string | null; allergenStatement: string | null } {
+  if (!raw) return { ingredients: null, allergenStatement: null };
+  let ingredients = cleanText(raw);
+  const allergenStatements: string[] = [];
+
+  const allergenRegex = /(?:^|[.;])\s*(contains|allergen(?: information)?|allergens?|may contain)\s*:?\s*([^.;]+)/gi;
+  let match: RegExpExecArray | null;
+  while ((match = allergenRegex.exec(ingredients)) !== null) {
+    const label = match[1] || "";
+    const value = match[2] || "";
+    if (/less than/i.test(value)) continue;
+    const full = cleanText(match[0].replace(/^[.;\s]+/, ""));
+    if (full) allergenStatements.push(full);
+  }
+
+  if (allergenStatements.length > 0) {
+    for (const statement of allergenStatements) {
+      ingredients = cleanText(ingredients.replace(statement, ""));
+    }
+    ingredients = ingredients.replace(/\s*[.;]\s*$/g, "").trim();
+  }
+
+  const allergenStatement = allergenStatements.length > 0 ? allergenStatements.join(" ") : null;
+  return { ingredients: ingredients || null, allergenStatement };
+}
+
 function isListingUrl(url: string): boolean {
   try {
     const u = new URL(url);
@@ -509,24 +574,7 @@ async function fetchRenderedHtml(url: string): Promise<string> {
 }
 
 async function fetchHtml(url: string): Promise<string> {
-  try {
-    const res = await axios.get(url, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-        Accept: "text/html,application/xhtml+xml",
-      },
-      timeout: 30000,
-    });
-    return res.data;
-  } catch (err: any) {
-    const status = err?.response?.status;
-    if (status === 403) {
-      if (DEBUG_NESTLE) console.log(`[DEBUG] axios 403, falling back to playwright: ${url}`);
-      return await fetchRenderedHtml(url);
-    }
-    throw err;
-  }
+  return await fetchRenderedHtml(url);
 }
 
 async function getServiceToken(): Promise<string> {
@@ -545,6 +593,10 @@ async function submitProductForReview(productOutput: ScraperProductOutput): Prom
   try {
     const token = await getServiceToken();
     const { scraper_job_id: _scraperJobId, ...body } = productOutput;
+    if (DEBUG_NESTLE) {
+      console.log("[DEBUG] submit body:");
+      console.log(JSON.stringify(body, null, 2));
+    }
     const res = await axios.post(`${API_BASE_URL}/submit-product-for-review`, body, {
       headers: { "Content-Type": "application/json", "X-Service-Token": token },
     });
@@ -593,17 +645,23 @@ function parseArgs() {
   const defaultConfig = new URL("./config.json", import.meta.url);
   let configPath = defaultConfig.pathname;
   let url: string | undefined;
+  let searchUrl: string | undefined;
   let limit: number | undefined;
   let offset: number | undefined;
   let local = false;
   let debug = false;
   let noHeadless = false;
+  let headless = false;
+  let concurrency = 6;
   for (let i = 0; i < argv.length; i++) {
     if ((argv[i] === "--url" || argv[i] === "-u") && argv[i + 1]) {
       url = argv[i + 1];
       i++;
-    } else if (argv[i] === "--config" && argv[i + 1]) {
-      configPath = argv[i + 1];
+    } else if ((argv[i] === "--search" || argv[i] === "-s") && argv[i + 1]) {
+      searchUrl = argv[i + 1];
+      i++;
+    } else if ((argv[i] === "--config" || argv[i] === "-c") && argv[i + 1]) {
+      configPath = path.resolve(argv[i + 1]);
       i++;
     } else if ((argv[i] === "--limit" || argv[i] === "-l") && argv[i + 1]) {
       const n = parseInt(argv[i + 1], 10);
@@ -619,12 +677,18 @@ function parseArgs() {
       debug = true;
     } else if (argv[i] === "--no-headless") {
       noHeadless = true;
+    } else if (argv[i] === "--headless") {
+      headless = true;
+    } else if ((argv[i] === "--concurrency" || argv[i] === "-n") && argv[i + 1]) {
+      const n = parseInt(argv[i + 1], 10);
+      if (!isNaN(n) && n > 0) concurrency = n;
+      i++;
     }
   }
-  return { url, configPath, limit, offset, local, debug, noHeadless };
+  return { url, searchUrl, configPath, limit, offset, local, debug, noHeadless, headless, concurrency };
 }
 
-async function fetchProduct(url: string, brandOverride?: string | null) {
+async function fetchProduct(url: string, brandOverride?: string | null): Promise<any | null> {
   const html = await fetchHtml(url);
   const $ = cheerio.load(html);
 
@@ -634,7 +698,6 @@ async function fetchProduct(url: string, brandOverride?: string | null) {
   const brand = brandOverride || brandRaw || jsonLd.brand || cleanText($('meta[property="og:site_name"]').attr("content")) || "";
 
   let name =
-    brandRaw ||
     cleanText($("h1").first().text()) ||
     jsonLd.name ||
     cleanText($('meta[property="og:title"]').attr("content")) ||
@@ -663,7 +726,11 @@ async function fetchProduct(url: string, brandOverride?: string | null) {
     null;
   const imageUrl = img ? new URL(decodeHtmlEntities(img), url).toString() : null;
 
-  const ingredientsText = extractIngredients($);
+  const ingredientsTextRaw = extractIngredients($);
+  const allergensFromDom = extractAllergens($);
+  const { ingredients: ingredientsText, allergenStatement: fromIngredients } =
+    splitIngredientsAndAllergens(ingredientsTextRaw);
+  const allergenStatement = allergensFromDom || fromIngredients;
   const nutrition = parseNutrition($);
 
   if (DEBUG_NESTLE) {
@@ -678,7 +745,13 @@ async function fetchProduct(url: string, brandOverride?: string | null) {
     console.log(`[DEBUG] nutrition calories: ${nutrition?.calories ?? "(null)"}`);
   }
 
-  return { url, name, brand, upc, imageUrl, ingredientsText, nutrition };
+  const exists = await checkProductExists({ name, brand, upc });
+  if (exists) {
+    console.log(`[SKIP] ${brand} ${name || "(no name)"}: already exists`);
+    return null;
+  }
+
+  return { url, name, brand, upc, imageUrl, ingredientsText, allergenStatement, nutrition };
 }
 
 function transformToOutput(p: any, jobId: string): ScraperProductOutput {
@@ -689,6 +762,7 @@ function transformToOutput(p: any, jobId: string): ScraperProductOutput {
     upc: p.upc || undefined,
     upcs: p.upc ? [p.upc] : undefined,
     ingredients_text: p.ingredientsText || "",
+    allergen_statement: p.allergenStatement || undefined,
     source: "goodnes.com",
     source_id: p.url,
     source_created_at: now,
@@ -703,10 +777,11 @@ function transformToOutput(p: any, jobId: string): ScraperProductOutput {
 }
 
 async function main() {
-  const { url, configPath, limit, offset, local, debug, noHeadless } = parseArgs();
+  const { url, searchUrl, configPath, limit, offset, local, debug, noHeadless, headless, concurrency } = parseArgs();
 
   DEBUG_NESTLE = debug;
   if (noHeadless) NESTLE_HEADLESS = false;
+  if (headless) NESTLE_HEADLESS = true;
   if (local) {
     console.log("Running in local mode: skipping DynamoDB and S3; API submission still runs.");
   }
@@ -731,12 +806,13 @@ async function main() {
   }
 
   let urls: UrlEntry[] = [];
-  if (url) {
-    if (isListingUrl(url)) {
+  const effectiveUrl = searchUrl || url;
+  if (effectiveUrl) {
+    if (isListingUrl(effectiveUrl)) {
       const targetCount = limit != null ? limit + (offset ?? 0) : undefined;
-      urls = await discoverListingUrls(url, targetCount, null);
+      urls = await discoverListingUrls(effectiveUrl, targetCount, null);
     } else {
-      urls = [{ url, brandOverride: null }];
+      urls = [{ url: effectiveUrl, brandOverride: null }];
     }
   } else {
     try {
@@ -752,8 +828,12 @@ async function main() {
         const entryUrl = entry.url;
         const entryBrand = entry.brand || null;
         const targetCount = limit != null ? limit + (offset ?? 0) : undefined;
-        const discovered = await discoverListingUrls(entryUrl, targetCount, entryBrand);
-        urls.push(...discovered);
+        try {
+          const discovered = await discoverListingUrls(entryUrl, targetCount, entryBrand);
+          urls.push(...discovered);
+        } catch (e: any) {
+          console.error(`[WARN] Failed to discover listing URLs for ${entryUrl}: ${e?.message || e}`);
+        }
         if (limit && urls.length >= limit + (offset ?? 0)) break;
       }
 
@@ -762,8 +842,8 @@ async function main() {
         urls.push({ url: entry.url, brandOverride: entry.brand || null });
         if (limit && urls.length >= limit + (offset ?? 0)) break;
       }
-    } catch {
-      // ignore
+    } catch (e: any) {
+      console.error(`[WARN] Failed to load config "${configPath}": ${e?.message || e}`);
     }
   }
 
@@ -778,11 +858,17 @@ async function main() {
   }
 
   const results: ScraperProductOutput[] = [];
-  for (const u of urls) {
-    const product = await fetchProduct(u.url, u.brandOverride ?? null);
-    if (!product || !product.name || !product.ingredientsText || !product.upc) continue;
-    results.push(transformToOutput(product, jobId));
-  }
+  const limitConcurrency = Math.max(1, concurrency || 4);
+  const limiter = pLimit(limitConcurrency);
+
+  const tasks = urls.map((u) =>
+    limiter(async () => {
+      const product = await fetchProduct(u.url, u.brandOverride ?? null);
+      if (!product || !product.name || !product.ingredientsText || !product.upc) return;
+      results.push(transformToOutput(product, jobId));
+    })
+  );
+  await Promise.all(tasks);
 
   if (!local) {
     await uploadToS3(results, jobId, runDateTime);

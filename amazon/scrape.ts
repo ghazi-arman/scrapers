@@ -1,22 +1,38 @@
 import * as fs from "fs";
 import { chromium, type Browser, type BrowserContext } from "playwright";
+import axios from "axios";
 import * as cheerio from "cheerio";
 import pLimit from "p-limit";
+import * as dotenv from "dotenv";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 import { v4 as uuidv4 } from "uuid";
 import type { ScraperProductOutput, ScraperNutritionData } from "../shared-types";
+import * as nameUtils from "../name-utils";
 import * as nutritionUtils from "../nutrition-utils";
+import * as servingSizeUtils from "../serving-size-utils";
+import * as productIdUtils from "../product-id-utils";
+
+dotenv.config();
 
 const parseNutrientAmountWithQualifier =
   (nutritionUtils as any).parseNutrientAmountWithQualifier ??
   (nutritionUtils as any).default?.parseNutrientAmountWithQualifier;
+const cleanProductName =
+  (nameUtils as any).cleanProductName ?? (nameUtils as any).default?.cleanProductName;
+const parseServingSizeFromText =
+  (servingSizeUtils as any).parseServingSizeFromText ??
+  (servingSizeUtils as any).default?.parseServingSizeFromText;
+const generateDeterministicProductId =
+  (productIdUtils as any).generateDeterministicProductId ??
+  (productIdUtils as any).default?.generateDeterministicProductId;
 
 type AppConfig = {
   urls?: string[];
   searchUrls?: string[];
+  brand?: string;
 };
 
 type NutritionNutrient = {
@@ -38,13 +54,17 @@ type ScrapedProduct = {
   productUrl: string;
   name: string | null;
   ingredients: string | null;
+  allergens: string | null;
   upc12: string | null;
+  upcs?: string[];
   nutrition: Nutrition | null;
+  nutritionData: ScraperNutritionData | null;
+  nutritionImageUrl: string | null;
   imageUrl: string | null;
   scrapedAt: string;
   sourceCreatedAt: string | null;
   sourceLastUpdatedAt: string | null;
-};
+}
 
 // AMAZON_USER_DATA_DIR=/tmp/amazon-profile npx tsx scrape.ts --config config.json --local --limit 1
 
@@ -52,12 +72,24 @@ const SOURCE = "amazon.com";
 const SCRAPER_NAME = process.env.JOB_NAME || "amazon";
 const SCRAPER_OUTPUTS_BUCKET = process.env.SCRAPER_OUTPUTS_BUCKET;
 const SCRAPER_JOB_STATUS_TABLE_NAME = process.env.SCRAPER_JOB_STATUS_TABLE_NAME;
-const API_BASE_URL = process.env.API_BASE_URL || "https://it7rdy3qbh.execute-api.us-west-2.amazonaws.com";
+const API_BASE_URL = process.env.API_BASE_URL || "https://api.mytummi.app";
 const API_KEYS_PARAMETER_NAME = process.env.API_KEYS_PARAMETER_NAME || "/tummi/api-keys";
-let DEBUG_AMAZON = false;
-const AMAZON_HEADLESS = process.env.AMAZON_HEADLESS !== "0";
+const AMAZON_BRAND_OVERRIDE = "365 by Whole Foods Market";
+let DEBUG_AMAZON = process.env.DEBUG_AMAZON === "1";
+let AMAZON_HEADLESS = process.env.AMAZON_HEADLESS !== "0";
 const AMAZON_SLOWMO = process.env.AMAZON_SLOWMO ? parseInt(process.env.AMAZON_SLOWMO, 10) : undefined;
 const AMAZON_USER_DATA_DIR = process.env.AMAZON_USER_DATA_DIR;
+const SCRAPEDO_TOKEN = process.env.SCRAPEDO_TOKEN || "";
+const SUBMIT_NUTRITION_PARSE_JOB_URL =
+  process.env.SUBMIT_NUTRITION_PARSE_JOB_URL ||
+  `${API_BASE_URL}/submit-nutrition-parse-job`;
+const GET_NUTRITION_PARSE_RESULT_URL =
+  process.env.GET_NUTRITION_PARSE_RESULT_URL ||
+  `${API_BASE_URL}/get-nutrition-parse-result`;
+const PARSE_NUTRITION_SERVICE_TOKEN = process.env.PARSE_NUTRITION_SERVICE_TOKEN || "12345";
+const NUTRITION_POLL_INTERVAL_MS = parseInt(process.env.NUTRITION_POLL_INTERVAL_MS || "2000", 10);
+const NUTRITION_POLL_TIMEOUT_MS = parseInt(process.env.NUTRITION_POLL_TIMEOUT_MS || "60000", 10);
+const PRODUCTS_API_URL = `${API_BASE_URL}/products`;
 
 const s3Client = new S3Client({});
 const dynamoDbClient = new DynamoDBClient({});
@@ -87,38 +119,43 @@ function decodeHtmlEntities(input: string | null): string | null {
     .trim();
 }
 
-function parseServingSize(servingSizeText: string | null): { value: number | null; unit: string | null } {
-  if (!servingSizeText || typeof servingSizeText !== "string") {
-    return {value: null, unit: null};
+async function checkProductExists(params: {
+  name: string | null;
+  brand: string | null;
+  upc: string | null;
+}): Promise<boolean> {
+  const { name, brand, upc } = params;
+  if (!name || typeof generateDeterministicProductId !== "function") return false;
+  const productId = generateDeterministicProductId(name, brand || undefined, upc || undefined);
+  try {
+    const token = await getServiceToken();
+    const res = await axios.get(`${PRODUCTS_API_URL}/${productId}`, {
+      headers: { "X-Service-Token": token },
+      timeout: 10_000,
+    });
+    return !!res?.data;
+  } catch (e: any) {
+    if (e?.response?.status === 404) return false;
+    if (DEBUG_AMAZON) console.log("[DEBUG] product exists check failed:", e);
+    return false;
   }
-  const cleaned = servingSizeText.trim().replace(/\([^)]*\)/g, "").trim();
-
-  let match = cleaned.match(
-    /^(\d+)\/(\d+)\s+(Tbsp|tbsp|TSP|tsp|cup|cups|oz|fl\s*oz|floz|ml|g|kg|lb|lbs|serving|servings|crackers?)\b/i
-  );
-  if (match) {
-    const value = parseFloat(match[1]) / parseFloat(match[2]);
-    let unit = match[3].trim();
-    if (unit.toLowerCase() === "crackers") unit = "cracker";
-    return {value, unit};
-  }
-
-  match = cleaned.match(
-    /^(\d+(?:\.\d+)?)\s+(Tbsp|tbsp|TSP|tsp|cup|cups|oz|fl\s*oz|floz|ml|g|kg|lb|lbs|serving|servings|crackers?)\b/i
-  );
-  if (!match) match = cleaned.match(/^(\d+(?:\.\d+)?)(g|oz|ml)\b/i);
-  if (match) {
-    const value = parseFloat(match[1]);
-    let unit = (match[2] || "g").trim();
-    if (unit.toLowerCase() === "crackers") unit = "cracker";
-    return {value, unit};
-  }
-
-  const numMatch = cleaned.match(/^(\d+(?:\.\d+)?)/);
-  if (numMatch) return {value: parseFloat(numMatch[1]), unit: "serving"};
-
-  return {value: null, unit: null};
 }
+
+function buildScrapeDoUrl(url: string): string {
+  if (!SCRAPEDO_TOKEN) {
+    throw new Error("SCRAPEDO_TOKEN is required to fetch Amazon pages via scrape.do");
+  }
+  const targetUrl = encodeURIComponent(url);
+  return `http://api.scrape.do/?url=${targetUrl}&token=${SCRAPEDO_TOKEN}`;
+}
+
+function parseServingSize(servingSizeText: string | null): { value: number | null; unit: string | null } {
+  if (typeof parseServingSizeFromText !== "function") {
+    throw new Error("parseServingSizeFromText import failed");
+  }
+  return parseServingSizeFromText(servingSizeText);
+}
+
 
 
 const NUTRIENT_COLUMN_MAP: Record<string, string> = {
@@ -210,6 +247,19 @@ function transformNutritionToDb(nutrition: Nutrition | null): ScraperNutritionDa
   return result;
 }
 
+function mergeNutritionData(primary: ScraperNutritionData | null, secondary: ScraperNutritionData | null): ScraperNutritionData | null {
+  if (primary && !secondary) return primary;
+  if (!primary && secondary) return secondary;
+  if (!primary && !secondary) return null;
+  const merged: ScraperNutritionData = { ...(secondary as ScraperNutritionData) };
+  for (const [key, value] of Object.entries(primary as ScraperNutritionData)) {
+    if (value !== undefined && value !== null && value !== "") {
+      (merged as any)[key] = value;
+    }
+  }
+  return merged;
+}
+
 function extractBrandFromName(name: string | null): string | null {
   if (!name) return null;
   const commaIdx = name.indexOf(",");
@@ -222,21 +272,14 @@ function extractBrandFromName(name: string | null): string | null {
 }
 
 function normalizeProductName(name: string | null, brand: string | null): string | null {
-  if (!name) return null;
-  let cleaned = decodeHtmlEntities(name) || name;
-  if (brand) {
-    const brandEscaped = brand.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    cleaned = cleaned.replace(new RegExp(`^${brandEscaped}\\s*,\\s*`, "i"), "");
-  }
-  cleaned = cleaned.replace(/\s*\|\s*.*$/, "");
-  cleaned = cleaned.replace(/\s*-\s*[^-]*$/, (m) => {
-    // Only drop the trailing segment if it looks like size/weight (contains digits and units)
-    return /(\d+|\d+\.\d+)\s*(oz|ounce|ounces|fl oz|count|ct|pack|lb|lbs|g|kg)\b/i.test(m) ? "" : m;
+  return cleanProductName(name, {
+    brand,
+    decodeHtml: true,
+    stripBrandPrefix: true,
+    stripPipe: true,
+    stripTrailingDashSize: true,
+    stripTrailingCommaSize: true,
   });
-  cleaned = cleaned.replace(/\s*,\s*[^,]*$/, (m) => {
-    return /(\d+|\d+\.\d+)\s*(oz|ounce|ounces|fl oz|count|ct|pack|lb|lbs|g|kg)\b/i.test(m) ? "" : m;
-  });
-  return normalizeWhitespace(cleaned);
 }
 
 function hasIngredientsOrNutrition(p: ScrapedProduct): boolean {
@@ -246,7 +289,7 @@ function hasIngredientsOrNutrition(p: ScrapedProduct): boolean {
     (!!p.nutrition.calories ||
       (p.nutrition.nutrients && p.nutrition.nutrients.length > 0) ||
       !!p.nutrition.servingSize);
-  return hasIngredients || hasNutrition;
+  return hasIngredients || hasNutrition || !!p.nutritionData;
 }
 
 function logScrapedData(p: ScrapedProduct, url: string): void {
@@ -259,9 +302,11 @@ function logScrapedData(p: ScrapedProduct, url: string): void {
 
   console.log(`  [DEBUG] name: ${p.name ?? "(null)"}`);
   console.log(`  [DEBUG] ingredients: ${hasIng ? `yes (${p.ingredients!.length} chars)` : "no"}`);
-  console.log(`  [DEBUG] nutrition: ${hasNut ? "yes" : "no"}`);
+  console.log(`  [DEBUG] nutrition: ${p.nutritionData ? "image-api" : hasNut ? "yes" : "no"}`);
+  console.log(`  [DEBUG] allergens: ${p.allergens ?? "(null)"}`);
   console.log(`  [DEBUG] upc12: ${p.upc12 ?? "(null)"}`);
   console.log(`  [DEBUG] image: ${p.imageUrl ?? "(null)"}`);
+  console.log(`  [DEBUG] nutritionImage: ${p.nutritionImageUrl ?? "(null)"}`);
   console.log(`  [DEBUG] url: ${url}`);
 }
 
@@ -295,18 +340,39 @@ function extractFromJsonLd(jsonText: string): Partial<ScrapedProduct> {
   return result;
 }
 
+function pickLargestDynamicImage(dynamic: string | null): string | null {
+  if (!dynamic) return null;
+  try {
+    const parsed = JSON.parse(dynamic) as Record<string, [number, number]>;
+    const entries = Object.entries(parsed);
+    if (entries.length === 0) return null;
+    entries.sort((a, b) => {
+      const aSize = (a[1]?.[0] || 0) * (a[1]?.[1] || 0);
+      const bSize = (b[1]?.[0] || 0) * (b[1]?.[1] || 0);
+      return bSize - aSize;
+    });
+    return entries[0][0] || null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeAmazonImageUrl(url: string | null): string | null {
+  if (!url) return null;
+  return url.trim();
+}
+
 function extractMainImageUrl($: cheerio.CheerioAPI): string | null {
+  const zoom = $("#ivLargeImage img").attr("src");
+  if (zoom) return zoom;
+
   const landing = $("#landingImage");
   const dynamic = landing.attr("data-a-dynamic-image");
-  if (dynamic) {
-    try {
-      const parsed = JSON.parse(dynamic) as Record<string, unknown>;
-      const urls = Object.keys(parsed);
-      if (urls.length > 0) return urls[0];
-    } catch {
-      // ignore
-    }
-  }
+  const dynamicLargest = pickLargestDynamicImage(dynamic);
+  if (dynamicLargest) return dynamicLargest;
+
+  const hiRes = landing.attr("data-old-hires") || landing.attr("data-zoom-hires");
+  if (hiRes) return hiRes;
 
   const img = $("#imgTagWrapperId img").attr("src");
   if (img) return img;
@@ -314,9 +380,46 @@ function extractMainImageUrl($: cheerio.CheerioAPI): string | null {
   return og || null;
 }
 
-function normalizeAmazonImageUrl(url: string | null): string | null {
-  if (!url) return null;
-  return url.replace(/\._[^.]+_\./, "._SL1000_.");
+function extractCarouselImageUrls($: cheerio.CheerioAPI): string[] {
+  const urls = new Set<string>();
+  const addUrl = (u?: string | null) => {
+    if (!u) return;
+    const normalized = normalizeAmazonImageUrl(u.trim());
+    if (normalized) urls.add(normalized);
+  };
+
+  addUrl($("#ivLargeImage img").attr("src"));
+
+  $("img[data-a-dynamic-image]").each((_, el) => {
+    const raw = $(el).attr("data-a-dynamic-image");
+    if (!raw) return;
+    const largest = pickLargestDynamicImage(raw);
+    if (largest) addUrl(largest);
+  });
+
+  $("#altImages img, #imageBlockThumbs img, #imageBlock img").each((_, el) => {
+    addUrl($(el).attr("data-old-hires"));
+    addUrl($(el).attr("data-src"));
+    addUrl($(el).attr("src"));
+    addUrl($(el).attr("data-zoom-hires"));
+  });
+
+  const landing = $("#landingImage");
+  const dynamic = landing.attr("data-a-dynamic-image");
+  const largestLanding = pickLargestDynamicImage(dynamic);
+  if (largestLanding) addUrl(largestLanding);
+  addUrl(landing.attr("data-old-hires"));
+  addUrl(landing.attr("data-zoom-hires"));
+
+  return Array.from(urls);
+}
+
+function imageQualityScore(url: string): number {
+  const slMatch = url.match(/_SL(\d+)_\./i);
+  if (slMatch) return parseInt(slMatch[1], 10);
+  const sizeMatch = url.match(/\\b(\\d{3,4})x(\\d{3,4})\\b/);
+  if (sizeMatch) return parseInt(sizeMatch[1], 10) * parseInt(sizeMatch[2], 10);
+  return 0;
 }
 
 function extractFromDetailBullets($: cheerio.CheerioAPI, labelRegex: RegExp): string | null {
@@ -360,6 +463,27 @@ function extractFromTables($: cheerio.CheerioAPI, labelRegex: RegExp): string | 
   return null;
 }
 
+function extractFromAnyTable($: cheerio.CheerioAPI, labelRegex: RegExp): string | null {
+  const tables = $("table");
+  let found: string | null = null;
+  tables.each((_, table) => {
+    if (found) return;
+    $(table)
+      .find("tr")
+      .each((_, row) => {
+        const th = normalizeWhitespace($(row).find("th").first().text());
+        if (!labelRegex.test(th)) return;
+        const td = normalizeWhitespace($(row).find("td").first().text());
+        if (td) {
+          found = td;
+          return false;
+        }
+        return undefined;
+      });
+  });
+  return found;
+}
+
 function extractFromImportantInfo($: cheerio.CheerioAPI, labelRegex: RegExp): string | null {
   const section = $("#important-information");
   if (!section.length) return null;
@@ -381,6 +505,28 @@ function extractFromImportantInfo($: cheerio.CheerioAPI, labelRegex: RegExp): st
     return undefined;
   });
   return found;
+}
+
+function extractUpcsFromText(text: string | null): string[] {
+  if (!text) return [];
+  const matches = text.match(/\b\d{12,13}\b/g);
+  if (!matches) return [];
+  const normalized = matches
+    .map((m) => (m.length === 13 ? m.slice(1) : m))
+    .filter((m) => m.length === 12);
+  return Array.from(new Set(normalized));
+}
+
+function extractAllergens($: cheerio.CheerioAPI): string | null {
+  const labelRegex = /allergen/i;
+  const fromBullets = extractFromDetailBullets($, labelRegex);
+  if (fromBullets) return fromBullets;
+  const fromTable = extractFromTables($, labelRegex);
+  if (fromTable) return fromTable;
+  const fromAnyTable = extractFromAnyTable($, labelRegex);
+  if (fromAnyTable) return fromAnyTable;
+  const fromInfo = extractFromImportantInfo($, labelRegex);
+  return fromInfo || null;
 }
 
 function extractNutritionFromText(text: string): Nutrition | null {
@@ -611,11 +757,157 @@ function extractNutritionFromEmbeddedJson($: cheerio.CheerioAPI): Nutrition | nu
   return found;
 }
 
-async function scrapeProductDetail(context: BrowserContext, productUrl: string, brandOverride?: string): Promise<ScrapedProduct> {
+function normalizeNutritionData(data: ScraperNutritionData): ScraperNutritionData {
+  const result: ScraperNutritionData = { ...data };
+  for (const [key, value] of Object.entries(result)) {
+    if (key.endsWith("_qualifier")) continue;
+    if (key === "serving_size_text" || key === "serving_size_unit_text" || key === "serving_size_unit_id") continue;
+    if (typeof value === "string") {
+      if (typeof parseNutrientAmountWithQualifier !== "function") {
+        throw new Error("parseNutrientAmountWithQualifier import failed");
+      }
+      const parsed = parseNutrientAmountWithQualifier(value);
+      if (parsed) {
+        (result as unknown as Record<string, number>)[key] = parsed.value;
+        const qualifierKey = `${key}_qualifier`;
+        if (!(qualifierKey in result) && parsed.qualifier) {
+          (result as unknown as Record<string, string>)[qualifierKey] = parsed.qualifier;
+        }
+      }
+    }
+  }
+  return result;
+}
+
+async function submitNutritionParseJob(imageUrl: string, mode?: string): Promise<string | null> {
+  try {
+    if (DEBUG_AMAZON) {
+      console.log(`[DEBUG] submit nutrition parse job: ${SUBMIT_NUTRITION_PARSE_JOB_URL}`);
+      console.log(`[DEBUG] nutrition api image_url=${imageUrl}`);
+      if (mode) console.log(`[DEBUG] nutrition api mode=${mode}`);
+    }
+    const res = await axios.post(
+      SUBMIT_NUTRITION_PARSE_JOB_URL,
+      { image_url: imageUrl, ...(mode ? { mode } : {}) },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Service-Token": PARSE_NUTRITION_SERVICE_TOKEN,
+        },
+        timeout: 60_000,
+      }
+    );
+    const jobId = res?.data?.job_id;
+    if (DEBUG_AMAZON) {
+      console.log("[DEBUG] submit nutrition parse response:");
+      console.log(JSON.stringify(res?.data ?? null, null, 2));
+    }
+    return typeof jobId === "string" ? jobId : null;
+  } catch (err) {
+    if (DEBUG_AMAZON) console.log("[DEBUG] nutrition API error:", err);
+  }
+  return null;
+}
+
+async function pollNutritionParseResult(jobId: string): Promise<any | null> {
+  const start = Date.now();
+  while (Date.now() - start < NUTRITION_POLL_TIMEOUT_MS) {
+    try {
+      const res = await axios.get(GET_NUTRITION_PARSE_RESULT_URL, {
+        params: { job_id: jobId },
+        headers: { "X-Service-Token": PARSE_NUTRITION_SERVICE_TOKEN },
+        timeout: 30_000,
+      });
+      const status = res?.data?.status;
+      if (DEBUG_AMAZON) {
+        console.log(`[DEBUG] nutrition parse status: ${status}`);
+      }
+      if (status === "completed") return res?.data?.result ?? null;
+      if (status === "failed") return null;
+    } catch (err) {
+      if (DEBUG_AMAZON) console.log("[DEBUG] nutrition poll error:", err);
+    }
+    await new Promise((r) => setTimeout(r, NUTRITION_POLL_INTERVAL_MS));
+  }
+  return null;
+}
+
+async function fetchNutritionFromImage(imageUrl: string): Promise<ScraperNutritionData | null> {
+  const jobId = await submitNutritionParseJob(imageUrl);
+  if (!jobId) return null;
+  const result = await pollNutritionParseResult(jobId);
+  const nutrition = result?.nutrition;
+  if (DEBUG_AMAZON) {
+    console.log("[DEBUG] nutrition parse result:");
+    console.log(JSON.stringify(result ?? null, null, 2));
+  }
+  if (nutrition && typeof nutrition === "object") {
+    const normalized = normalizeNutritionData(nutrition as ScraperNutritionData);
+    const hasAny = Object.entries(normalized).some(
+      ([key, value]) =>
+        value !== undefined &&
+        value !== null &&
+        value !== "" &&
+        !key.endsWith("_qualifier") &&
+        key !== "serving_size_text" &&
+        key !== "serving_size_unit_text" &&
+        key !== "serving_size_unit_id"
+    );
+    return hasAny ? normalized : null;
+  }
+  return null;
+}
+
+async function fetchNutritionOcrText(imageUrl: string): Promise<string | null> {
+  try {
+    const jobId = await submitNutritionParseJob(imageUrl, "ocr_only");
+    if (!jobId) return null;
+    const result = await pollNutritionParseResult(jobId);
+    const text = result?.ocr_text;
+    if (DEBUG_AMAZON) {
+      console.log("[DEBUG] nutrition api (ocr_only) result:");
+      console.log(JSON.stringify(result ?? null, null, 2));
+    }
+    return typeof text === "string" ? text : null;
+  } catch (err) {
+    if (DEBUG_AMAZON) console.log("[DEBUG] nutrition api (ocr_only) error:", err);
+  }
+  return null;
+}
+
+async function detectNutritionImageFromCarousel(imageUrls: string[]): Promise<string | null> {
+  if (DEBUG_AMAZON) {
+    console.log(`[DEBUG] scanning ${imageUrls.length} carousel images for nutrition label`);
+  }
+  for (const url of imageUrls) {
+    if (!url) continue;
+    if (/loading|loadIndicators|\.gif($|\?)/i.test(url)) continue;
+    await new Promise((r) => setTimeout(r, 200));
+    const ocrText = await fetchNutritionOcrText(url);
+    if (DEBUG_AMAZON) {
+      const snippet = ocrText ? ocrText.replace(/\s+/g, " ").slice(0, 120) : "(no text)";
+      console.log(`[DEBUG] carousel image: ${url}`);
+      console.log(`[DEBUG] ocr snippet: ${snippet}`);
+    }
+    if (ocrText) {
+      const lower = ocrText.toLowerCase();
+      if (
+        (lower.includes("nutrition") && lower.includes("facts")) ||
+        lower.includes("supplement facts")
+      ) {
+        return url;
+      }
+    }
+  }
+  return null;
+}
+
+async function scrapeProductDetail(context: BrowserContext, productUrl: string, brandOverride?: string): Promise<ScrapedProduct | null> {
   const page = await context.newPage();
   try {
     let nutritionFromApi: Nutrition | null = null;
     let nutritionTextFromDom: string | null = null;
+    let overlayImages: string[] = [];
     const debugResponses: Array<{ url: string; size?: number }> = [];
     page.on("response", async (res) => {
       if (nutritionFromApi) return;
@@ -653,28 +945,153 @@ async function scrapeProductDetail(context: BrowserContext, productUrl: string, 
       }
     });
 
-    await page.goto(productUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await page.waitForTimeout(1200);
-    await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
+    await page.goto(buildScrapeDoUrl(productUrl), { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.waitForTimeout(500);
+    await page.waitForLoadState("networkidle", { timeout: 2000 }).catch(() => {});
+
+    // Early existence check before heavy parsing/overlay actions
+    try {
+      const earlyHtml = await page.content();
+      const $early = cheerio.load(earlyHtml);
+      let earlyJsonLd: Partial<ScrapedProduct> = {};
+      $early('script[type="application/ld+json"]').each((_, el) => {
+        const txt = $early(el).contents().text();
+        if (!txt) return;
+        const res = extractFromJsonLd(txt);
+        if (res.name || res.upc12 || res.imageUrl || res.brand) earlyJsonLd = { ...earlyJsonLd, ...res };
+      });
+
+      const earlyName =
+        earlyJsonLd.name ??
+        decodeHtmlEntities($early("#productTitle").first().text()) ??
+        decodeHtmlEntities($early("h1").first().text()) ??
+        decodeHtmlEntities($early('meta[property="og:title"]').attr("content") || null) ??
+        null;
+
+      const earlyBrand =
+        AMAZON_BRAND_OVERRIDE || brandOverride || earlyJsonLd.brand || extractBrandFromName(earlyName) || "Unknown";
+      const earlyCleanedName = normalizeProductName(earlyName, AMAZON_BRAND_OVERRIDE || brandOverride || null);
+
+      let earlyUpc12 = earlyJsonLd.upc12 ?? null;
+      if (!earlyUpc12) {
+        const upc =
+          extractFromDetailBullets($early, /^upc/i) ||
+          extractFromTables($early, /^upc/i) ||
+          extractFromTables($early, /^gtin\-?12/i);
+        if (upc) {
+          const list = extractUpcsFromText(upc);
+          if (list.length > 0) earlyUpc12 = list[0] ?? null;
+        }
+      }
+
+      const exists = await checkProductExists({
+        name: earlyCleanedName ?? earlyName,
+        brand: earlyBrand,
+        upc: earlyUpc12,
+      });
+      if (exists) {
+        console.log(`[SKIP] ${earlyBrand} ${earlyCleanedName ?? earlyName ?? "(no name)"}: already exists`);
+        return null;
+      }
+    } catch (e) {
+      if (DEBUG_AMAZON) console.log("[DEBUG] early existence check failed:", e);
+    }
+
+    const maybeCloseImageZoom = async (): Promise<void> => {
+      const closeBtn = page.locator("#ivClose, .ivClose, .ivCloseBtn, button[aria-label='Close'], button[aria-label='Close image']");
+      if (await closeBtn.count()) {
+        await closeBtn.first().click({ timeout: 1000 }).catch(() => {});
+      } else {
+        await page.keyboard.press("Escape").catch(() => {});
+      }
+      await page.waitForTimeout(200);
+    };
+
+    const maybeOpenImageZoom = async (): Promise<void> => {
+      const candidates = [
+        "#landingImage",
+        "#imgTagWrapperId img",
+        "#main-image-container img",
+        "#imageBlock img",
+      ];
+      for (const sel of candidates) {
+        const loc = page.locator(sel);
+        if (!(await loc.count())) continue;
+        await loc.first().scrollIntoViewIfNeeded().catch(() => {});
+        await loc.first().click({ timeout: 1000 }).catch(() => {});
+        await page.waitForSelector("#ivLargeImage img", { timeout: 2000 }).catch(() => {});
+        break;
+      }
+    };
+
+    const collectOverlayImages = async (): Promise<string[]> => {
+      const images: string[] = [];
+      const getLargeSrc = async (): Promise<string | null> => {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const src = await page.locator("#ivLargeImage img").first().getAttribute("src").catch(() => null);
+          const normalized = src ? normalizeAmazonImageUrl(src) : null;
+          if (normalized && !/loading|loadIndicators|\.gif($|\?)/i.test(normalized)) return normalized;
+          await page.waitForTimeout(200);
+        }
+        return null;
+      };
+
+      const first = await getLargeSrc();
+      if (first) images.push(first);
+
+      const thumbs = page.locator("#ivThumbs img, #ivThumbs .ivThumb, #ivThumbs li");
+      const count = await thumbs.count().catch(() => 0);
+      for (let i = 0; i < count; i++) {
+        const thumb = thumbs.nth(i);
+        await thumb.scrollIntoViewIfNeeded().catch(() => {});
+        await thumb.click({ timeout: 1000 }).catch(() => {});
+        await page.waitForTimeout(200);
+        const src = await getLargeSrc();
+        if (src && !images.includes(src)) images.push(src);
+      }
+      return images;
+    };
+
+    const maybeExpandItemDetails = async (): Promise<void> => {
+      const section = page.locator("#item_details, #important-information");
+      if (await section.count()) {
+        await section.first().scrollIntoViewIfNeeded().catch(() => {});
+        await page.waitForTimeout(200);
+      }
+      const expander = page.locator("a.a-expander-header:has-text('Item details'), a[data-action='a-expander-toggle']:has-text('Item details')");
+      if (await expander.count()) {
+        const expanded = await expander.first().getAttribute("aria-expanded").catch(() => null);
+        if (expanded === "false") {
+          await expander.first().click({ timeout: 1000 }).catch(() => {});
+        }
+      }
+      await page.waitForSelector("#item_details table", { timeout: 2000 }).catch(() => {});
+      await page.waitForTimeout(300);
+    };
+
+    await maybeExpandItemDetails();
+    await maybeCloseImageZoom();
+    await maybeOpenImageZoom();
+    overlayImages = await collectOverlayImages();
 
     const maybeExpandNutrition = async (): Promise<void> => {
       const section = page.locator("#nutritionalInfoAndIngredients_feature_div");
       if (await section.count()) {
         await section.first().scrollIntoViewIfNeeded().catch(() => {});
-        await page.waitForTimeout(600);
+        await page.waitForTimeout(400);
       }
       const expander = page.locator("a[data-a-expander-name='nic-nutrition-facts-expander']");
       if (await expander.count()) {
         await expander.first().click({ timeout: 2000 }).catch(() => {});
       }
-      await page.waitForTimeout(2000);
+      await page.waitForTimeout(800);
       await page
         .waitForFunction(
           () =>
             /Cholesterol|Vitamin D|Calcium|Iron|Potassium/.test(
               document.body?.innerText || ""
             ),
-          { timeout: 8000 }
+          { timeout: 2000 }
         )
         .catch(() => {});
     };
@@ -695,6 +1112,13 @@ async function scrapeProductDetail(context: BrowserContext, productUrl: string, 
     } catch {
       // ignore
     }
+
+    const allergensFromDom = await page
+      .locator("#item_details tr", { hasText: "Allergen" })
+      .locator("td")
+      .first()
+      .innerText()
+      .catch(() => null);
 
     const html = await page.content();
     if (DEBUG_AMAZON) {
@@ -729,22 +1153,43 @@ async function scrapeProductDetail(context: BrowserContext, productUrl: string, 
       decodeHtmlEntities($('meta[property="og:title"]').attr("content") || null) ??
       null;
 
-    const brand = brandOverride || jsonLdResult.brand || extractBrandFromName(name) || "Unknown";
+    const brand = AMAZON_BRAND_OVERRIDE || brandOverride || jsonLdResult.brand || extractBrandFromName(name) || "Unknown";
 
-    const cleanedName = normalizeProductName(name, brand);
+    const cleanedName = normalizeProductName(name, AMAZON_BRAND_OVERRIDE || brandOverride || null);
 
-    const imageUrl = normalizeAmazonImageUrl(jsonLdResult.imageUrl ?? extractMainImageUrl($) ?? null);
+    const overlayPrimaryImage = overlayImages.length > 0 ? overlayImages[0] : null;
+    const imageUrl = overlayPrimaryImage ?? normalizeAmazonImageUrl(jsonLdResult.imageUrl ?? extractMainImageUrl($) ?? null);
 
     let upc12 = jsonLdResult.upc12 ?? null;
+    let upcs: string[] = [];
     if (!upc12) {
       const upc =
         extractFromDetailBullets($, /^upc/i) ||
         extractFromTables($, /^upc/i) ||
         extractFromTables($, /^gtin\-?12/i);
       if (upc) {
-        const m = upc.match(/(\d{12})/);
-        upc12 = m?.[1] ?? null;
+        const list = extractUpcsFromText(upc);
+        if (list.length > 0) {
+          upcs = list;
+          upc12 = list[0] ?? null;
+        }
       }
+    }
+    const upcFromItemDetails = await page
+      .locator("#item_details tr", { hasText: "UPC" })
+      .locator("td")
+      .first()
+      .innerText()
+      .catch(() => null);
+    if (upcFromItemDetails) {
+      const list = extractUpcsFromText(upcFromItemDetails);
+      if (list.length > 0) {
+        upcs = Array.from(new Set([...(upcs || []), ...list]));
+        upc12 = upc12 || upcs[0] || null;
+      }
+    }
+    if (upc12 && (!upcs || upcs.length === 0)) {
+      upcs = [upc12];
     }
 
     const ingredients =
@@ -753,6 +1198,26 @@ async function scrapeProductDetail(context: BrowserContext, productUrl: string, 
       extractFromTables($, /^ingredients?/i) ||
       extractFromImportantInfo($, /^ingredients?/i) ||
       null;
+    const allergens =
+      (allergensFromDom ? normalizeWhitespace(allergensFromDom) : null) ||
+      extractAllergens($) ||
+      extractFromDetailBullets($, /^allergen information/i) ||
+      extractFromTables($, /^allergen information/i) ||
+      extractFromImportantInfo($, /^allergen information/i) ||
+      null;
+
+    const carouselImages = overlayImages.length > 0 ? overlayImages : extractCarouselImageUrls($);
+    const nutritionScanImages = [...carouselImages].sort(
+      (a, b) => imageQualityScore(b) - imageQualityScore(a)
+    );
+    let nutritionImageUrl: string | null = null;
+    let nutritionData: ScraperNutritionData | null = null;
+    if (nutritionScanImages.length > 0) {
+      nutritionImageUrl = await detectNutritionImageFromCarousel(nutritionScanImages);
+      if (nutritionImageUrl) {
+        nutritionData = await fetchNutritionFromImage(nutritionImageUrl);
+      }
+    }
 
     const nutritionFromNic = extractNutritionFromNic($);
     const nutritionFromEmbedded = extractNutritionFromEmbeddedJson($);
@@ -767,6 +1232,9 @@ async function scrapeProductDetail(context: BrowserContext, productUrl: string, 
       nutritionFromTable ||
       extractNutritionFromText(nutritionTextFromDom || nutritionSectionText || $("body").text());
 
+    const nutritionFromDomData = transformNutritionToDb(nutrition);
+    const mergedNutritionData = mergeNutritionData(nutritionData, nutritionFromDomData);
+
     const now = new Date().toISOString();
 
     return {brand,
@@ -774,8 +1242,12 @@ async function scrapeProductDetail(context: BrowserContext, productUrl: string, 
       productUrl,
       name: cleanedName ?? name,
       ingredients: ingredients ? normalizeWhitespace(ingredients) : null,
+      allergens: allergens ? normalizeWhitespace(allergens) : null,
       upc12,
+      upcs: upcs && upcs.length > 0 ? upcs : undefined,
       nutrition,
+      nutritionData: mergedNutritionData,
+      nutritionImageUrl,
       imageUrl,
       scrapedAt: now,
       sourceCreatedAt: null,
@@ -787,23 +1259,29 @@ async function scrapeProductDetail(context: BrowserContext, productUrl: string, 
 
 function transformToOutput(p: ScrapedProduct): ScraperProductOutput {
   const now = new Date().toISOString();
-  const serving = p.nutrition?.servingSize
-    ? parseServingSize(p.nutrition.servingSize)
-    : { value: null, unit: null };
+  const serving =
+    p.nutritionData?.serving_size_value != null
+      ? { value: p.nutritionData.serving_size_value, unit: p.nutritionData.serving_size_unit_text || "serving" }
+      : p.nutrition?.servingSize
+        ? parseServingSize(p.nutrition.servingSize)
+        : { value: null, unit: null };
+  const servingText = p.nutritionData?.serving_size_text || p.nutrition?.servingSize || undefined;
 
   return {product_name: p.name || "",
     brand: p.brand,
     upc: p.upc12 || undefined,
+    upcs: p.upcs && p.upcs.length > 0 ? p.upcs : undefined,
     ingredients_text: p.ingredients || "",
+    allergen_statement: p.allergens || undefined,
     serving_size_value: serving.value ?? undefined,
     serving_size_unit: serving.unit ?? undefined,
-    serving_size_text: p.nutrition?.servingSize ?? undefined,
+    serving_size_text: servingText,
     source: SOURCE,
     source_id: p.productUrl,
     source_created_at: p.sourceCreatedAt || now,
     source_last_updated_at: p.sourceLastUpdatedAt || now,
     image_url: p.imageUrl || undefined,
-    nutrition: transformNutritionToDb(p.nutrition) || undefined};
+    nutrition: p.nutritionData || transformNutritionToDb(p.nutrition) || undefined};
 }
 
 async function getServiceToken(): Promise<string> {
@@ -829,6 +1307,10 @@ async function submitProduct(p: ScrapedProduct): Promise<boolean> {
     const token = await getServiceToken();
     const body = transformToOutput(p);
     const { scraper_job_id: _, ...req } = body as any;
+    if (DEBUG_AMAZON) {
+      console.log("[DEBUG] submit body:");
+      console.log(JSON.stringify(req, null, 2));
+    }
 
     const res = await fetch(`${API_BASE_URL}/submit-product-for-review`, {
       method: "POST",
@@ -888,6 +1370,10 @@ function parseArgs() {
   let limit: number | undefined;
   let local = false;
   let debug = false;
+  let noHeadless = false;
+  let headless = false;
+  let offset = 0;
+  let concurrency = 10;
 
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--url" || argv[i] === "-u") {
@@ -903,14 +1389,26 @@ function parseArgs() {
       limit = parseInt(argv[i + 1], 10);
       if (isNaN(limit) || limit < 1) limit = undefined;
       i++;
+    } else if ((argv[i] === "--offset" || argv[i] === "-o") && argv[i + 1]) {
+      const n = parseInt(argv[i + 1], 10);
+      if (!isNaN(n) && n >= 0) offset = n;
+      i++;
+    } else if ((argv[i] === "--concurrency" || argv[i] === "-n") && argv[i + 1]) {
+      const n = parseInt(argv[i + 1], 10);
+      if (!isNaN(n) && n > 0) concurrency = n;
+      i++;
     } else if (argv[i] === "--local") {
       local = true;
     } else if ((argv[i] === "--debug" || argv[i] === "-d")) {
       debug = true;
+    } else if (argv[i] === "--no-headless") {
+      noHeadless = true;
+    } else if (argv[i] === "--headless") {
+      headless = true;
     }
   }
 
-  return { url, configPath, limit, local, searchUrl, debug };
+  return { url, configPath, limit, local, searchUrl, debug, noHeadless, headless, offset, concurrency };
 }
 
 function normalizeAmazonUrl(href: string): string | null {
@@ -935,8 +1433,9 @@ async function scrapeAislePage(context: BrowserContext, aisleUrl: string, limit?
     const seen = new Set<string>();
     let idleRounds = 0;
     let scrollCount = 0;
+    let prevScrollHeight = 0;
 
-    while (idleRounds < 8) {
+    while (idleRounds < 3) {
       scrollCount++;
       const links = await page.$$eval("a[href*='/dp/'], a[href*='/gp/product/']", (els) =>
         els
@@ -967,13 +1466,20 @@ async function scrapeAislePage(context: BrowserContext, aisleUrl: string, limit?
       const showMore = page.getByRole("button", { name: /show more/i });
       if (await showMore.count()) {
         await showMore.first().click({ timeout: 2000 }).catch(() => {});
-        await page.waitForTimeout(2500);
+        await page.waitForTimeout(1500);
       } else {
-        // Slow scroll to trigger lazy-load
-        const steps = 6;
-        for (let i = 0; i < steps; i++) {
-          await page.evaluate(() => window.scrollBy(0, window.innerHeight * 0.9));
-          await page.waitForTimeout(600);
+        const currentHeight = await page.evaluate(() => document.body.scrollHeight).catch(() => 0);
+        if (currentHeight > prevScrollHeight) {
+          prevScrollHeight = currentHeight;
+          await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+          await page.waitForTimeout(1200);
+        } else {
+          // Slow scroll to trigger lazy-load
+          const steps = 4;
+          for (let i = 0; i < steps; i++) {
+            await page.evaluate(() => window.scrollBy(0, window.innerHeight * 0.95));
+            await page.waitForTimeout(400);
+          }
         }
       }
 
@@ -1013,12 +1519,15 @@ async function scrapeAislePage(context: BrowserContext, aisleUrl: string, limit?
 }
 
 async function main(): Promise<void> {
-  const { url, configPath, limit, local, searchUrl, debug } = parseArgs();
+  const { url, configPath, limit, local, searchUrl, debug, noHeadless, headless, offset, concurrency } = parseArgs();
 
-  DEBUG_AMAZON = debug;
+  DEBUG_AMAZON = debug || DEBUG_AMAZON;
+  if (noHeadless) AMAZON_HEADLESS = false;
+  if (headless) AMAZON_HEADLESS = true;
 
   let productTargets: string[] = [];
   let searchTargets: string[] = [];
+  let configBrand: string | undefined;
 
   if (url) {
     productTargets = [url];
@@ -1032,12 +1541,14 @@ async function main(): Promise<void> {
     if (Array.isArray(cfg.searchUrls) && cfg.searchUrls.length > 0) {
       searchTargets = cfg.searchUrls.filter((u) => typeof u === "string" && u.startsWith("https://www.amazon.com/"));
     }
+    if (typeof cfg.brand === "string" && cfg.brand.trim()) configBrand = cfg.brand.trim();
   } else {
     console.error("Usage: npx tsx scrape.ts --url <AMAZON_PRODUCT_URL>");
     console.error("   or: npx tsx scrape.ts --config ./config.json [--limit N] [--local]");
     process.exit(1);
   }
 
+  if (offset > 0 && productTargets.length > 0) productTargets = productTargets.slice(offset);
   if (limit != null && productTargets.length > 0) productTargets = productTargets.slice(0, limit);
 
   if (productTargets.length === 0 && searchTargets.length === 0) {
@@ -1085,7 +1596,7 @@ async function main(): Promise<void> {
     });
   }
 
-  const limiter = pLimit(3);
+  const limiter = pLimit(concurrency);
   const outputs: ScraperProductOutput[] = [];
   let skipped = 0;
 
@@ -1094,46 +1605,74 @@ async function main(): Promise<void> {
     if (searchTargets.length > 0) {
       const discovered: string[] = [];
       for (const target of searchTargets) {
-        const found = await scrapeAislePage(context, target, limit);
+        const desiredCount = limit ? limit + offset : undefined;
+        const remaining = desiredCount != null ? Math.max(desiredCount - discovered.length, 0) : undefined;
+        const found = await scrapeAislePage(context, target, remaining && remaining > 0 ? remaining : undefined);
         console.log(`[DISCOVER] Collected ${found.length} product URLs from aisle page`);
         discovered.push(...found);
-        if (limit && discovered.length >= limit) break;
+        if (limit && discovered.length >= limit + offset) break;
       }
-      productUrls = limit ? discovered.slice(0, limit) : discovered;
+      productUrls = discovered.slice(offset, limit ? offset + limit : undefined);
       if (productUrls.length === 0) {
-        console.error("No valid Amazon product URLs found on aisle page.");
+        if (discovered.length > 0 && offset > 0) {
+          console.error(`No valid Amazon product URLs found after applying offset ${offset}.`);
+        } else {
+          console.error("No valid Amazon product URLs found on aisle page.");
+        }
         return;
       }
     }
 
-    const results = await Promise.all(
-      productUrls.map((u) =>
-        limiter(async () => {
-          const p = await scrapeProductDetail(context, u);
-          return { product: p, url: u };
-        })
-      )
+    const completedBuffer: Array<{ product: ScrapedProduct; url: string }> = [];
+    let flushChain = Promise.resolve();
+
+    const processBatch = async (batch: Array<{ product: ScrapedProduct; url: string }>): Promise<void> => {
+      for (const { product: p, url: u } of batch) {
+        if (!hasIngredientsOrNutrition(p)) {
+          skipped++;
+          console.log(`[SKIP] ${p.name ?? "(no name)"}: no ingredients and no nutrition`);
+          logScrapedData(p, u);
+          continue;
+        }
+        if (!p.upc12) {
+          skipped++;
+          console.log(`[SKIP] ${p.name ?? "(no name)"}: missing UPC`);
+          logScrapedData(p, u);
+          continue;
+        }
+
+        outputs.push(transformToOutput(p));
+        console.log(`[OK] ${p.name ?? "(no name)"} | ${u}`);
+
+        await submitProduct(p);
+      }
+    };
+
+    const enqueueFlush = (force = false): Promise<void> => {
+      flushChain = flushChain.then(async () => {
+        if (completedBuffer.length < 10 && !force) return;
+        const batch = completedBuffer.splice(0, force ? completedBuffer.length : 10);
+        if (batch.length > 0) {
+          await processBatch(batch);
+        }
+      });
+      return flushChain;
+    };
+
+    const tasks = productUrls.map((u) =>
+      limiter(async () => {
+        const p = await scrapeProductDetail(context, u, configBrand);
+        if (!p) {
+          skipped++;
+          return;
+        }
+        completedBuffer.push({ product: p, url: u });
+        await enqueueFlush(false);
+      })
     );
 
-    for (const { product: p, url: u } of results) {
-      if (!hasIngredientsOrNutrition(p)) {
-        skipped++;
-        console.log(`[SKIP] ${p.name ?? "(no name)"}: no ingredients and no nutrition`);
-        logScrapedData(p, u);
-        continue;
-      }
-      if (!p.upc12) {
-        skipped++;
-        console.log(`[SKIP] ${p.name ?? "(no name)"}: missing UPC`);
-        logScrapedData(p, u);
-        continue;
-      }
-
-      outputs.push(transformToOutput(p));
-      console.log(`[OK] ${p.name ?? "(no name)"} | ${u}`);
-
-      await submitProduct(p);
-    }
+    await Promise.all(tasks);
+    await enqueueFlush(true);
   } catch (e) {
     console.error(e);
     if (!local) await updateJobStatus(jobId, "failed", String(e));

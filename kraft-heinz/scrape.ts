@@ -5,6 +5,7 @@ import { chromium, Browser, Page } from "playwright";
 import * as cheerio from "cheerio";
 import pLimit from "p-limit";
 import axios from "axios";
+import * as dotenv from "dotenv";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
@@ -12,10 +13,30 @@ import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 import { v4 as uuidv4 } from "uuid";
 import type { ScraperProductOutput, ScraperNutritionData } from "../shared-types";
 import * as nutritionUtils from "../nutrition-utils";
+import * as servingSizeUtils from "../serving-size-utils";
+import * as nameUtils from "../name-utils";
+import * as productIdUtils from "../product-id-utils";
+import { fileURLToPath } from "url";
+
+dotenv.config();
 
 const parseNutrientAmountWithQualifier =
   (nutritionUtils as any).parseNutrientAmountWithQualifier ??
   (nutritionUtils as any).default?.parseNutrientAmountWithQualifier;
+const normalizeNutritionData =
+  (nutritionUtils as any).normalizeNutritionData ??
+  (nutritionUtils as any).default?.normalizeNutritionData;
+const parseServingSizeFromText =
+  (servingSizeUtils as any).parseServingSizeFromText ??
+  (servingSizeUtils as any).default?.parseServingSizeFromText;
+const cleanProductName =
+  (nameUtils as any).cleanProductName ?? (nameUtils as any).default?.cleanProductName;
+const generateDeterministicProductId =
+  (productIdUtils as any).generateDeterministicProductId ??
+  (productIdUtils as any).default?.generateDeterministicProductId;
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 type BrandConfig = {
   brand: string;
@@ -24,9 +45,11 @@ type BrandConfig = {
 };
 
 type AppConfig = {
-  outputPath: string;
-  concurrency: number;
-  brands: BrandConfig[];
+  urls?: Array<string | { url: string; brand?: string; source?: string }>;
+  searchUrls?: Array<string | { url: string; brand?: string; source?: string }>;
+  brand?: string;
+  source?: string;
+  concurrency?: number;
 };
 
 type NutritionNutrient = {
@@ -51,8 +74,11 @@ type ScrapedProduct = {
 
   name: string | null;
   ingredients: string | null;
+  allergens: string | null;
   upc12: string | null;
   nutrition: Nutrition | null;
+  nutritionData?: ScraperNutritionData | null;
+  nutritionImageUrl?: string | null;
   imageUrl: string | null;
 
   scrapedAt: string;
@@ -71,8 +97,20 @@ const ssmClient = new SSMClient({});
 const SCRAPER_NAME = process.env.JOB_NAME || "kraftheinz";
 const SCRAPER_OUTPUTS_BUCKET = process.env.SCRAPER_OUTPUTS_BUCKET;
 const SCRAPER_JOB_STATUS_TABLE_NAME = process.env.SCRAPER_JOB_STATUS_TABLE_NAME;
-const API_BASE_URL = process.env.API_BASE_URL || "https://it7rdy3qbh.execute-api.us-west-2.amazonaws.com";
+const API_BASE_URL = process.env.API_BASE_URL || "https://api.mytummi.app";
 const API_KEYS_PARAMETER_NAME = process.env.API_KEYS_PARAMETER_NAME || "/tummi/api-keys";
+let DEBUG_KH = process.env.DEBUG_KH === "1";
+let KRAFT_HEADLESS = process.env.KRAFT_HEADLESS !== "0";
+const SUBMIT_NUTRITION_PARSE_JOB_URL =
+  process.env.SUBMIT_NUTRITION_PARSE_JOB_URL ||
+  `${API_BASE_URL}/submit-nutrition-parse-job`;
+const GET_NUTRITION_PARSE_RESULT_URL =
+  process.env.GET_NUTRITION_PARSE_RESULT_URL ||
+  `${API_BASE_URL}/get-nutrition-parse-result`;
+const PARSE_NUTRITION_SERVICE_TOKEN = process.env.PARSE_NUTRITION_SERVICE_TOKEN || "12345";
+const NUTRITION_POLL_INTERVAL_MS = parseInt(process.env.NUTRITION_POLL_INTERVAL_MS || "2000", 10);
+const NUTRITION_POLL_TIMEOUT_MS = parseInt(process.env.NUTRITION_POLL_TIMEOUT_MS || "60000", 10);
+const PRODUCTS_API_URL = `${API_BASE_URL}/products`;
 
 // Cache for service token
 let serviceTokenCache: string | null = null;
@@ -85,6 +123,28 @@ function normalizeWhitespace(s: string): string {
   return s.replace(/\s+/g, " ").trim();
 }
 
+async function checkProductExists(params: {
+  name: string | null;
+  brand: string | null;
+  upc: string | null;
+}): Promise<boolean> {
+  const { name, brand, upc } = params;
+  if (!name || typeof generateDeterministicProductId !== "function") return false;
+  const productId = generateDeterministicProductId(name, brand || undefined, upc || undefined);
+  try {
+    const token = await getServiceToken();
+    const res = await axios.get(`${PRODUCTS_API_URL}/${productId}`, {
+      headers: { "X-Service-Token": token },
+      timeout: 10_000,
+    });
+    return !!res?.data;
+  } catch (e: any) {
+    if (e?.response?.status === 404) return false;
+    if (DEBUG_KH) console.log("[DEBUG] product exists check failed:", e);
+    return false;
+  }
+}
+
 function sha256(input: string): string {
   return crypto.createHash("sha256").update(input).digest("hex");
 }
@@ -93,69 +153,12 @@ function sha256(input: string): string {
  * Parse serving size text (e.g., "1 Tbsp (20g)", "8 fl oz", "240ml", "1/4 cup", "1/2 cup") into value and unit
  */
 function parseServingSize(servingSizeText: string | null): { value: number | null; unit: string | null } {
-  if (!servingSizeText || typeof servingSizeText !== 'string') {
-    return {value: null, unit: null};
+  if (typeof parseServingSizeFromText !== "function") {
+    throw new Error("parseServingSizeFromText import failed");
   }
-
-  // Clean the text - remove parentheses content and extra whitespace
-  const cleaned = servingSizeText.trim().replace(/\([^)]*\)/g, '').trim();
-  
-  // Try multiple patterns to be more lenient
-  // Pattern 1: Fraction like "1/4 cup" or "1/2 cup" or "3/4 cup"
-  let match = cleaned.match(/^(\d+)\/(\d+)\s+(Tbsp|tbsp|TSP|tsp|cup|cups|oz|fl\s*oz|floz|ml|g|kg|lb|lbs|serving|servings)\b/i);
-  if (match) {
-    const numerator = parseFloat(match[1]);
-    const denominator = parseFloat(match[2]);
-    const value = numerator / denominator;
-    let unit = match[3].trim();
-    
-    // Normalize unit
-    if (unit.toLowerCase() === 'tbsp') unit = 'Tbsp';
-    else if (unit.toLowerCase() === 'tsp') unit = 'tsp';
-    else if (unit.toLowerCase() === 'cups' || unit.toLowerCase() === 'cup') unit = 'cup';
-    else if (unit.toLowerCase() === 'lbs') unit = 'lb';
-    else if (unit.toLowerCase() === 'fl oz' || unit.toLowerCase() === 'floz') unit = 'fl oz';
-    else if (unit.toLowerCase() === 'servings') unit = 'serving';
-    else unit = unit.charAt(0).toUpperCase() + unit.slice(1).toLowerCase();
-    
-    return {value, unit};
-  }
-  
-  // Pattern 2: "1 Tbsp" or "8 fl oz" (with space, whole number or decimal)
-  match = cleaned.match(/^(\d+(?:\.\d+)?)\s+(Tbsp|tbsp|TSP|tsp|cup|cups|oz|fl\s*oz|floz|ml|g|kg|lb|lbs|serving|servings)\b/i);
-  
-  // Pattern 3: "8fl oz" or "240ml" (without space, but with unit)
-  if (!match) {
-    match = cleaned.match(/^(\d+(?:\.\d+)?)(Tbsp|tbsp|TSP|tsp|cup|cups|oz|fl\s*oz|floz|ml|g|kg|lb|lbs|serving|servings)\b/i);
-  }
-  
-  // Pattern 4: Just a number (default to "serving")
-  if (!match) {
-    const numMatch = cleaned.match(/^(\d+(?:\.\d+)?)/);
-    if (numMatch) {
-      return {value: parseFloat(numMatch[1]), unit: 'serving'};
-    }
-  }
-  
-  if (match) {
-    const value = parseFloat(match[1]);
-    let unit = match[2].trim();
-    
-    // Normalize unit to standard form
-    if (unit.toLowerCase() === 'tbsp') unit = 'Tbsp';
-    else if (unit.toLowerCase() === 'tsp') unit = 'tsp';
-    else if (unit.toLowerCase() === 'cups' || unit.toLowerCase() === 'cup') unit = 'cup';
-    else if (unit.toLowerCase() === 'lbs') unit = 'lb';
-    else if (unit.toLowerCase() === 'fl oz' || unit.toLowerCase() === 'floz') unit = 'fl oz';
-    else if (unit.toLowerCase() === 'servings') unit = 'serving';
-    else unit = unit.charAt(0).toUpperCase() + unit.slice(1).toLowerCase();
-    
-    return {value, unit};
-  }
-
-  console.log(`Warning: Could not parse serving size: "${servingSizeText}"`);
-  return {value: null, unit: null};
+  return parseServingSizeFromText(servingSizeText);
 }
+
 
 
 /**
@@ -168,6 +171,8 @@ function mapNutrientNameToColumn(name: string): string | null {
     'total fat': 'total_fat_g',
     'saturated fat': 'saturated_fat_g',
     'trans fat': 'trans_fat_g',
+    'polyunsaturated fat': 'polyunsaturated_fat_g',
+    'monounsaturated fat': 'monounsaturated_fat_g',
     'cholesterol': 'cholesterol_mg',
     'sodium': 'sodium_mg',
     'total carbohydrate': 'total_carbs_g',
@@ -345,6 +350,10 @@ async function submitProductForReview(product: ScrapedProduct): Promise<boolean>
     const productOutput = transformProductToApiRequest(product);
     // Remove scraper_job_id for API submission (it's only for S3)
     const { scraper_job_id, ...requestBody } = productOutput;
+    if (DEBUG_KH) {
+      console.log("[DEBUG] submit body:");
+      console.log(JSON.stringify(requestBody, null, 2));
+    }
 
     const response = await axios.post(
       `${API_BASE_URL}/submit-product-for-review`,
@@ -448,12 +457,13 @@ function transformProductToApiRequest(product: ScrapedProduct): ScraperProductOu
     : { value: null, unit: null };
   
   // Transform nutrition data to database format
-  const nutrition = transformNutritionToDbFormat(product.nutrition);
+  const nutrition = product.nutritionData || transformNutritionToDbFormat(product.nutrition);
   
   return {product_name: product.name || '',
     brand: product.brand,
     upc: product.upc12 || undefined,
     ingredients_text: product.ingredients || '',
+    allergen_statement: product.allergens || undefined,
     serving_size_value: servingSize.value ?? undefined,
     serving_size_unit: servingSize.unit ?? undefined,
     serving_size_text: product.nutrition?.servingSize ?? undefined,
@@ -616,6 +626,242 @@ function parseName($: cheerio.CheerioAPI): string | null {
   return null;
 }
 
+function parseNameFromNextData($: cheerio.CheerioAPI): string | null {
+  try {
+    const nextDataScript = $('script#__NEXT_DATA__').html();
+    if (!nextDataScript) return null;
+    const jsonData = JSON.parse(nextDataScript);
+    const looksLikeSlug = (value: string): boolean => {
+      const v = value.trim();
+      if (!v) return true;
+      if (/\s/.test(v)) return false;
+      if (/[A-Z]/.test(v)) return false;
+      return /-/.test(v) && /\d/.test(v);
+    };
+
+    const productFields = extractNextDataProductFields(jsonData);
+    if (productFields) {
+      const directCandidates = [
+        productFields.name,
+        productFields.displayName,
+        productFields.productName,
+        productFields.title,
+        productFields.entryTitle,
+      ].filter((v: any) => typeof v === "string") as string[];
+      for (const candidate of directCandidates) {
+        const v = normalizeWhitespace(candidate);
+        if (
+          v.length > 3 &&
+          v.length < 200 &&
+          !looksLikeSlug(v) &&
+          !/navbar|menu|mega menu|nav bar/i.test(v) &&
+          !/^\s*>/.test(v)
+        ) {
+          return v;
+        }
+      }
+    }
+
+    const findName = (obj: any): string | null => {
+      if (!obj || typeof obj !== "object") return null;
+      if (typeof obj.name === "string") {
+        const v = normalizeWhitespace(obj.name);
+        if (
+          v.length > 3 &&
+          v.length < 200 &&
+          !looksLikeSlug(v) &&
+          !/navbar|menu|mega menu|nav bar/i.test(v) &&
+          !/^\s*>/.test(v)
+        ) {
+          return v;
+        }
+      }
+      if (obj.fields?.name && typeof obj.fields.name === "string") {
+        const v = normalizeWhitespace(obj.fields.name);
+        if (
+          v.length > 3 &&
+          v.length < 200 &&
+          !looksLikeSlug(v) &&
+          !/navbar|menu|mega menu|nav bar/i.test(v) &&
+          !/^\s*>/.test(v)
+        ) {
+          return v;
+        }
+      }
+      if (obj.fields?.entryTitle && typeof obj.fields.entryTitle === "string") {
+        const v = normalizeWhitespace(obj.fields.entryTitle);
+        if (
+          v.length > 3 &&
+          v.length < 200 &&
+          !looksLikeSlug(v) &&
+          !/navbar|menu|mega menu|nav bar/i.test(v) &&
+          !/^\s*>/.test(v)
+        ) {
+          return v;
+        }
+      }
+      if (Array.isArray(obj)) {
+        for (const item of obj) {
+          const found = findName(item);
+          if (found) return found;
+        }
+      } else {
+        for (const key of Object.keys(obj)) {
+          if (obj[key] && typeof obj[key] === "object") {
+            const found = findName(obj[key]);
+            if (found) return found;
+          }
+        }
+      }
+      return null;
+    };
+    return findName(jsonData);
+  } catch {
+    return null;
+  }
+}
+
+function extractNextData($: cheerio.CheerioAPI): any | null {
+  try {
+    const nextDataScript = $('script#__NEXT_DATA__').html();
+    if (!nextDataScript) return null;
+    return JSON.parse(nextDataScript);
+  } catch {
+    return null;
+  }
+}
+
+function extractNextDataProductFields(nextData: any): any | null {
+  if (!nextData || typeof nextData !== "object") return null;
+  const productRefs = nextData?.props?.pageProps?.template?.product?.references;
+  if (Array.isArray(productRefs) && productRefs.length > 0) {
+    // Prefer the actual product entry by content type when available
+    for (const ref of productRefs) {
+      const entry = ref?.entry ?? ref;
+      const contentTypeId = entry?.sys?.contentType?.sys?.id;
+      if (contentTypeId === "ct-product" && entry?.fields && typeof entry.fields === "object") {
+        return entry.fields;
+      }
+    }
+    for (const ref of productRefs) {
+      const entry = ref?.entry ?? ref;
+      const fields = entry?.fields;
+      if (fields && typeof fields === "object") {
+        const hasProductSignal =
+          typeof fields.ingredients === "string" ||
+          typeof fields.allergenInformation === "string" ||
+          typeof fields.allergens === "string" ||
+          typeof fields.name === "string" ||
+          typeof fields.displayName === "string" ||
+          typeof fields.productName === "string" ||
+          typeof fields.title === "string";
+        if (hasProductSignal) return fields;
+      }
+    }
+  }
+  return null;
+}
+
+function extractNextDataProductEntry(nextData: any): any | null {
+  if (!nextData || typeof nextData !== "object") return null;
+  const productRefs = nextData?.props?.pageProps?.template?.product?.references;
+  if (Array.isArray(productRefs) && productRefs.length > 0) {
+    for (const ref of productRefs) {
+      const entry = ref?.entry ?? ref;
+      const contentTypeId = entry?.sys?.contentType?.sys?.id;
+      if (contentTypeId === "ct-product") return entry;
+    }
+    for (const ref of productRefs) {
+      const entry = ref?.entry ?? ref;
+      if (entry && typeof entry === "object") return entry;
+    }
+  }
+  return null;
+}
+
+function extractImageUrlFromNextData(nextData: any, productUrl: string): string | null {
+  const fields = extractNextDataProductFields(nextData);
+  const candidates: any[] = [];
+  if (!fields || typeof fields !== "object") return null;
+
+  const pushMaybe = (value: any) => {
+    if (value == null) return;
+    if (Array.isArray(value)) {
+      candidates.push(...value);
+    } else {
+      candidates.push(value);
+    }
+  };
+
+  pushMaybe(fields.image);
+  pushMaybe(fields.images);
+  pushMaybe(fields.primaryImage);
+  pushMaybe(fields.productImage);
+  pushMaybe(fields.heroImage);
+  pushMaybe(fields.packshot);
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (typeof candidate === "string") {
+      try {
+        const url = candidate.startsWith("//") ? `https:${candidate}` : candidate;
+        return new URL(url, productUrl).toString();
+      } catch {
+        continue;
+      }
+    }
+    const url =
+      candidate?.fields?.file?.url ??
+      candidate?.file?.url ??
+      candidate?.fields?.url ??
+      candidate?.url ??
+      null;
+    if (typeof url === "string") {
+      try {
+        const resolved = url.startsWith("//") ? `https:${url}` : url;
+        return new URL(resolved, productUrl).toString();
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  return null;
+}
+
+function extractUpc12FromNextData($: cheerio.CheerioAPI): string | null {
+  const nextData = extractNextData($);
+  if (!nextData) return null;
+
+  const entry = extractNextDataProductEntry(nextData);
+  const fields = extractNextDataProductFields(nextData);
+  const candidates: string[] = [];
+
+  const pushCandidate = (value: any) => {
+    if (typeof value === "string") candidates.push(value);
+  };
+
+  pushCandidate(fields?.upc);
+  pushCandidate(fields?.upc12);
+  pushCandidate(fields?.gtin);
+  pushCandidate(fields?.gtin12);
+  pushCandidate(fields?.gtin13);
+  pushCandidate(fields?.gtin14);
+  pushCandidate(fields?.productId);
+  pushCandidate(fields?.productID);
+  pushCandidate(fields?.sku);
+  pushCandidate(fields?.itemNumber);
+  pushCandidate(fields?.entryTitle);
+  pushCandidate(entry?.sys?.id);
+
+  for (const candidate of candidates) {
+    const m = candidate.match(/(\d{12,14})/);
+    if (m?.[1]) return m[1].slice(-12);
+  }
+
+  return null;
+}
+
 function findSectionValueByHeading($: cheerio.CheerioAPI, headingRegex: RegExp): string | null {
   // Look for headings/labels that match the section name and then read nearby content
   const candidates = $("h1,h2,h3,h4,h5,strong,span,div,p")
@@ -648,7 +894,20 @@ function findSectionValueByHeading($: cheerio.CheerioAPI, headingRegex: RegExp):
 }
 
 function parseIngredients($: cheerio.CheerioAPI): string | null {
-  // First, try to extract from JSON-LD structured data
+  // First, try to extract from __NEXT_DATA__ (primary source)
+  try {
+    const nextData = extractNextData($);
+    const fields = extractNextDataProductFields(nextData);
+    const direct = fields?.ingredients;
+    if (typeof direct === "string") {
+      const ingredients = normalizeWhitespace(direct);
+      if (ingredients.length > 10 && ingredients.length < 2000) return ingredients;
+    }
+  } catch {
+    // Continue to other methods
+  }
+
+  // Second, try to extract from JSON-LD structured data
   try {
     const scripts = $('script[type="application/ld+json"]').toArray();
     for (const el of scripts) {
@@ -696,45 +955,6 @@ function parseIngredients($: cheerio.CheerioAPI): string | null {
     // Continue to other methods
   }
   
-  // Second, try to extract from __NEXT_DATA__
-  try {
-    const nextDataScript = $('script#__NEXT_DATA__').html();
-    if (nextDataScript) {
-      const nextData = JSON.parse(nextDataScript);
-      
-      // Recursively search for ingredients field
-      const findIngredients = (obj: any): string | null => {
-        if (!obj || typeof obj !== 'object') return null;
-        
-        // Check if this object has ingredients
-        if (obj.ingredients && typeof obj.ingredients === 'string') {
-          const ingredients = normalizeWhitespace(obj.ingredients);
-          if (ingredients.length > 10 && ingredients.length < 2000) return ingredients;
-        }
-        
-        // Check for fields.ingredients (common in Next.js data structures)
-        if (obj.fields?.ingredients && typeof obj.fields.ingredients === 'string') {
-          const ingredients = normalizeWhitespace(obj.fields.ingredients);
-          if (ingredients.length > 10 && ingredients.length < 2000) return ingredients;
-        }
-        
-        // Recursively search nested objects/arrays
-        for (const key of Object.keys(obj)) {
-          if (obj[key] && typeof obj[key] === 'object') {
-            const found = findIngredients(obj[key]);
-            if (found) return found;
-          }
-        }
-        return null;
-      };
-      
-      const ingredients = findIngredients(nextData);
-      if (ingredients) return ingredients;
-    }
-  } catch {
-    // Continue to DOM parsing
-  }
-
   // Third, prefer a labeled "Ingredients" section in the DOM.
   // Some pages use "INGREDIENTS" uppercase; match exact-ish.
   const v =
@@ -760,9 +980,171 @@ function parseIngredients($: cheerio.CheerioAPI): string | null {
   return null;
 }
 
+function parseAllergens($: cheerio.CheerioAPI): string | null {
+  // Try __NEXT_DATA__ first (primary source)
+  try {
+    const nextData = extractNextData($);
+    const fields = extractNextDataProductFields(nextData);
+    const direct = fields?.allergenInformation ?? fields?.allergens;
+    if (typeof direct === "string") {
+      const v = normalizeWhitespace(direct);
+      if (v.length > 3 && v.length < 500) return v;
+    }
+  } catch {
+    // ignore
+  }
+
+  // Try JSON-LD / embedded JSON next
+  try {
+    const scripts = $('script[type="application/ld+json"]').toArray();
+    for (const el of scripts) {
+      const jsonText = $(el).html();
+      if (!jsonText) continue;
+      try {
+        const jsonData = JSON.parse(jsonText);
+        const findAllergens = (obj: any): string | null => {
+          if (!obj || typeof obj !== "object") return null;
+          if (typeof obj.allergenInformation === "string") {
+            const v = normalizeWhitespace(obj.allergenInformation);
+            if (v.length > 3 && v.length < 500) return v;
+          }
+          if (typeof obj.allergens === "string") {
+            const v = normalizeWhitespace(obj.allergens);
+            if (v.length > 3 && v.length < 500) return v;
+          }
+          if (obj.fields?.allergenInformation && typeof obj.fields.allergenInformation === "string") {
+            const v = normalizeWhitespace(obj.fields.allergenInformation);
+            if (v.length > 3 && v.length < 500) return v;
+          }
+          if (Array.isArray(obj)) {
+            for (const item of obj) {
+              const found = findAllergens(item);
+              if (found) return found;
+            }
+          } else {
+            for (const key of Object.keys(obj)) {
+              if (obj[key] && typeof obj[key] === "object") {
+                const found = findAllergens(obj[key]);
+                if (found) return found;
+              }
+            }
+          }
+          return null;
+        };
+        const allergens = findAllergens(jsonData);
+        if (allergens) return allergens;
+      } catch {
+        // ignore JSON errors
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  const isValidAllergenText = (text: string): boolean => {
+    if (!text || text.length > 300) return false;
+    const lower = text.toLowerCase();
+    if (lower.includes("buy online") || lower.includes("other products") || lower.includes("you may like")) {
+      return false;
+    }
+    if (lower.includes("contains")) return true;
+    return /(milk|egg|eggs|wheat|soy|peanut|tree nut|shellfish|fish|sesame)/i.test(text);
+  };
+
+  const v =
+    findSectionValueByHeading($, /^allergens?$/i) ??
+    findSectionValueByHeading($, /^contains:/i) ??
+    findSectionValueByHeading($, /^ingredients\s*(and|&)\s*allergens?$/i);
+  if (v && isValidAllergenText(v)) return v;
+
+  const body = normalizeWhitespace($("body").text());
+  const m = body.match(/Allergens?\s*:?\s*([^]{3,300})/i) || body.match(/Contains:\s*([^]{3,300})/i);
+  if (m?.[1]) {
+    const candidate = normalizeWhitespace(m[1]);
+    if (isValidAllergenText(candidate)) return candidate;
+  }
+
+  return null;
+}
+
+async function submitNutritionParseJob(imageUrl: string): Promise<string | null> {
+  try {
+    const res = await axios.post(
+      SUBMIT_NUTRITION_PARSE_JOB_URL,
+      { image_url: imageUrl },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Service-Token": PARSE_NUTRITION_SERVICE_TOKEN,
+        },
+        timeout: 60_000,
+      }
+    );
+    const jobId = res?.data?.job_id;
+    if (DEBUG_KH) {
+      console.log("[DEBUG] submit nutrition parse response:");
+      console.log(JSON.stringify(res?.data ?? null, null, 2));
+    }
+    return typeof jobId === "string" ? jobId : null;
+  } catch (err) {
+    if (DEBUG_KH) console.log("[DEBUG] nutrition API error:", err);
+  }
+  return null;
+}
+
+async function pollNutritionParseResult(jobId: string): Promise<any | null> {
+  const start = Date.now();
+  while (Date.now() - start < NUTRITION_POLL_TIMEOUT_MS) {
+    try {
+      const res = await axios.get(GET_NUTRITION_PARSE_RESULT_URL, {
+        params: { job_id: jobId },
+        headers: { "X-Service-Token": PARSE_NUTRITION_SERVICE_TOKEN },
+        timeout: 30_000,
+      });
+      const status = res?.data?.status;
+      if (DEBUG_KH) {
+        console.log(`[DEBUG] nutrition parse status: ${status}`);
+      }
+      if (status === "completed") return res?.data?.result ?? null;
+      if (status === "failed") return null;
+    } catch (err) {
+      if (DEBUG_KH) console.log("[DEBUG] nutrition poll error:", err);
+    }
+    await new Promise((r) => setTimeout(r, NUTRITION_POLL_INTERVAL_MS));
+  }
+  return null;
+}
+
+async function fetchNutritionFromImage(imageUrl: string): Promise<ScraperNutritionData | null> {
+  const jobId = await submitNutritionParseJob(imageUrl);
+  if (!jobId) return null;
+  const result = await pollNutritionParseResult(jobId);
+  const nutrition = result?.nutrition;
+  if (DEBUG_KH) {
+    console.log("[DEBUG] nutrition parse result:");
+    console.log(JSON.stringify(result ?? null, null, 2));
+  }
+  if (nutrition && typeof nutrition === "object") {
+    if (typeof normalizeNutritionData === "function") {
+      return normalizeNutritionData(nutrition as ScraperNutritionData);
+    }
+    return nutrition as ScraperNutritionData;
+  }
+  return null;
+}
+
 function parseImageUrl($: cheerio.CheerioAPI, productUrl: string): string | null {
   // Try multiple strategies to find the product image
   
+  // 0. Look for image in __NEXT_DATA__ (primary source)
+  try {
+    const nextData = extractNextData($);
+    const nextImage = extractImageUrlFromNextData(nextData, productUrl);
+    if (nextImage) return nextImage;
+  } catch {
+    // Continue to next strategy
+  }
+
   // 1. Look for JSON-LD structured data with image
   try {
     let foundImage: string | null = null;
@@ -879,8 +1261,165 @@ function extractUpc12FromJsonLd($: cheerio.CheerioAPI): string | null {
   return foundUpc;
 }
 
+function parseNutritionFromNextData(nextData: any): Nutrition | null {
+  if (!nextData || typeof nextData !== "object") return null;
+  try {
+    // Search recursively for objects containing nutrition data (with items array and servingSize)
+    const findNutritionData = (obj: any, path: string = 'root'): { items: any[]; servingSize?: string; servingsPerContainer?: string } | null => {
+      if (!obj || typeof obj !== 'object') return null;
+      
+      // Check if this is an object with an items array containing nutrition fields
+      if (!Array.isArray(obj) && obj.items && Array.isArray(obj.items)) {
+        // Check if first item has the nutrition fields structure
+        if (obj.items.length > 0 && obj.items[0]?.fields?.externalId) {
+          const externalId = obj.items[0].fields.externalId;
+          if (externalId.includes('NUTRSRV1')) {
+            return {items: obj.items,
+              servingSize: obj.servingSize || undefined,
+              servingsPerContainer: obj.servingsPerContainer || undefined};
+          }
+        }
+      }
+      
+      // Check if this is an object with fields.items array (alternative structure)
+      if (!Array.isArray(obj) && obj.fields?.items && Array.isArray(obj.fields.items)) {
+        // Check if first item has the nutrition fields structure
+        if (obj.fields.items.length > 0 && obj.fields.items[0]?.fields?.externalId) {
+          const externalId = obj.fields.items[0].fields.externalId;
+          if (externalId.includes('NUTRSRV1')) {
+            return {items: obj.fields.items,
+              servingSize: obj.servingSize || obj.fields.servingSize || undefined,
+              servingsPerContainer: obj.servingsPerContainer || obj.fields.servingsPerContainer || undefined};
+          }
+        }
+      }
+      
+      // Check if this is an array of nutrition objects with fields (fallback for different structure)
+      if (Array.isArray(obj)) {
+        if (obj.length > 0 && obj[0]?.fields?.externalId) {
+          const externalId = obj[0].fields.externalId;
+          if (externalId.includes('NUTRSRV1')) {
+            return {items: obj};
+          }
+        }
+        // Also recursively search within array elements
+        for (let i = 0; i < Math.min(obj.length, 10); i++) { // Limit to first 10 to avoid performance issues
+          if (obj[i] && typeof obj[i] === 'object') {
+            const found = findNutritionData(obj[i], `${path}[${i}]`);
+            if (found) return found;
+          }
+        }
+        return null; // Don't continue with object key iteration for arrays
+      }
+      
+      // Recursively search nested objects/arrays
+      for (const key of Object.keys(obj)) {
+        if (obj[key] && typeof obj[key] === 'object') {
+          const found = findNutritionData(obj[key], `${path}.${key}`);
+          if (found) return found;
+        }
+      }
+      return null;
+    };
+    
+    const nutritionData = findNutritionData(nextData);
+    
+    if (nutritionData && nutritionData.items && nutritionData.items.length > 0) {
+      const nutritionArray = nutritionData.items;
+      let servingSize: string | null = nutritionData.servingSize || null;
+      let servingsPerContainer: string | null = nutritionData.servingsPerContainer || null;
+      let calories: string | null = null;
+      const nutrients: NutritionNutrient[] = [];
+      
+      // Map of externalId to nutrient name
+      const nutrientNameMap: { [key: string]: string } = {
+        'F_NUTRSRV1_FAT': 'Total Fat',
+        'F_NUTRSRV1_TOTFAT': 'Total Fat',
+        'F_NUTRSRV1_SATFAT': 'Saturated Fat',
+        'F_NUTRSRV1_FASAT': 'Saturated Fat',
+        'F_NUTRSRV1_TRNFAT': 'Trans Fat',
+        'F_NUTRSRV1_FATRN': 'Trans Fat',
+        'F_NUTRSRV1_FAPU': 'Polyunsaturated Fat',
+        'F_NUTRSRV1_FAMS': 'Monounsaturated Fat',
+        'F_NUTRSRV1_CHOL': 'Cholesterol',
+        'F_NUTRSRV1_SOD': 'Sodium',
+        'F_NUTRSRV1_NA': 'Sodium',
+        'F_NUTRSRV1_TOTCARB': 'Total Carbohydrate',
+        'F_NUTRSRV1_CARB': 'Total Carbohydrate',
+        'F_NUTRSRV1_CHO': 'Total Carbohydrate',
+        'F_NUTRSRV1_FIBTSW': 'Dietary Fiber',
+        'F_NUTRSRV1_FIB': 'Dietary Fiber',
+        'F_NUTRSRV1_TOTSUG': 'Total Sugars',
+        'F_NUTRSRV1_SUGAR': 'Total Sugars',
+        'F_NUTRSRV1_ADDSUG': 'Added Sugars',
+        'F_NUTRSRV1_PRO': 'Protein',
+        'F_NUTRSRV1_VITD': 'Vitamin D',
+        'F_NUTRSRV1_CA': 'Calcium',
+        'F_NUTRSRV1_FE': 'Iron',
+        'F_NUTRSRV1_K': 'Potassium',
+      };
+      
+      // Process each nutrition field
+      for (const item of nutritionArray) {
+        const fields = item.fields || item;
+        const externalId = fields.externalId || fields.id;
+        const amount = fields.amount;
+        const dailyPercent = fields.dailyPercent || fields.dailyValue;
+        
+        if (!externalId) continue;
+        
+        // Check for serving size
+        if (externalId.includes('SERVSIZE') || externalId.includes('SERVSIZ')) {
+          servingSize = amount || null;
+          continue;
+        }
+        
+        // Check for servings per container
+        if (externalId.includes('SERVCON')) {
+          servingsPerContainer = amount || null;
+          continue;
+        }
+        
+        // Check for calories
+        if (externalId.includes('CALORIES') || externalId.includes('CAL') || externalId.includes('ENER')) {
+          calories = amount || null;
+          continue;
+        }
+        
+        // Check if this is a known nutrient
+        const nutrientName = nutrientNameMap[externalId];
+        if (nutrientName && amount) {
+          nutrients.push({
+            name: nutrientName,
+            amount: String(amount),
+            dailyValuePercent: dailyPercent ? String(dailyPercent) : null,
+          });
+        }
+      }
+        
+      if (servingSize || calories || nutrients.length > 0) {
+        return {
+          servingSize: servingSize ? normalizeWhitespace(servingSize) : null,
+          servingsPerContainer: servingsPerContainer ? normalizeWhitespace(servingsPerContainer) : null,
+          calories,
+          nutrients,
+          rawText: `Found ${nutrients.length} nutrients from __NEXT_DATA__`,
+        };
+      }
+    }
+  } catch (e) {
+    console.log('Error in __NEXT_DATA__ nutrition extraction:', e);
+  }
+  return null;
+}
+
 function parseNutrition($: cheerio.CheerioAPI): Nutrition | null {
-  // First, try to extract from JSON-LD structured data
+  // First, try to extract from __NEXT_DATA__
+  const nextData = extractNextData($);
+  const nextNutrition = parseNutritionFromNextData(nextData);
+  if (nextNutrition) return nextNutrition;
+
+  // Second, try to extract from JSON-LD structured data
   try {
     const scripts = $('script[type="application/ld+json"]').toArray();
     
@@ -927,26 +1466,31 @@ function parseNutrition($: cheerio.CheerioAPI): Nutrition | null {
           const nutrients: NutritionNutrient[] = [];
           
           // Map of externalId to nutrient name
-          const nutrientNameMap: { [key: string]: string } = {
-            'F_NUTRSRV1_FAT': 'Total Fat',
-            'F_NUTRSRV1_TOTFAT': 'Total Fat',
-            'F_NUTRSRV1_SATFAT': 'Saturated Fat',
-            'F_NUTRSRV1_TRNFAT': 'Trans Fat',
-            'F_NUTRSRV1_FATRN': 'Trans Fat',
-            'F_NUTRSRV1_CHOL': 'Cholesterol',
-            'F_NUTRSRV1_SOD': 'Sodium',
-            'F_NUTRSRV1_TOTCARB': 'Total Carbohydrate',
-            'F_NUTRSRV1_CARB': 'Total Carbohydrate',
-            'F_NUTRSRV1_FIBTSW': 'Dietary Fiber',
-            'F_NUTRSRV1_TOTSUG': 'Total Sugars',
-            'F_NUTRSRV1_SUGAR': 'Total Sugars',
-            'F_NUTRSRV1_ADDSUG': 'Added Sugars',
-            'F_NUTRSRV1_PRO': 'Protein',
-            'F_NUTRSRV1_VITD': 'Vitamin D',
-            'F_NUTRSRV1_CA': 'Calcium',
-            'F_NUTRSRV1_FE': 'Iron',
-            'F_NUTRSRV1_K': 'Potassium',
-          };
+        const nutrientNameMap: { [key: string]: string } = {
+          'F_NUTRSRV1_FAT': 'Total Fat',
+          'F_NUTRSRV1_TOTFAT': 'Total Fat',
+          'F_NUTRSRV1_SATFAT': 'Saturated Fat',
+          'F_NUTRSRV1_FASAT': 'Saturated Fat',
+          'F_NUTRSRV1_TRNFAT': 'Trans Fat',
+          'F_NUTRSRV1_FATRN': 'Trans Fat',
+          'F_NUTRSRV1_FAPU': 'Polyunsaturated Fat',
+          'F_NUTRSRV1_FAMS': 'Monounsaturated Fat',
+          'F_NUTRSRV1_CHOL': 'Cholesterol',
+          'F_NUTRSRV1_SOD': 'Sodium',
+          'F_NUTRSRV1_TOTCARB': 'Total Carbohydrate',
+          'F_NUTRSRV1_CARB': 'Total Carbohydrate',
+          'F_NUTRSRV1_CHO': 'Total Carbohydrate',
+          'F_NUTRSRV1_FIBTSW': 'Dietary Fiber',
+          'F_NUTRSRV1_FIB': 'Dietary Fiber',
+          'F_NUTRSRV1_TOTSUG': 'Total Sugars',
+          'F_NUTRSRV1_SUGAR': 'Total Sugars',
+          'F_NUTRSRV1_ADDSUG': 'Added Sugars',
+          'F_NUTRSRV1_PRO': 'Protein',
+          'F_NUTRSRV1_VITD': 'Vitamin D',
+          'F_NUTRSRV1_CA': 'Calcium',
+          'F_NUTRSRV1_FE': 'Iron',
+          'F_NUTRSRV1_K': 'Potassium',
+        };
           
           // Process each nutrition field
           for (const item of nutritionArray) {
@@ -970,10 +1514,10 @@ function parseNutrition($: cheerio.CheerioAPI): Nutrition | null {
             }
             
             // Check for calories
-            if (externalId.includes('CALORIES') || externalId.includes('CAL')) {
-              calories = amount || null;
-              continue;
-            }
+          if (externalId.includes('CALORIES') || externalId.includes('CAL') || externalId.includes('ENER')) {
+            calories = amount || null;
+            continue;
+          }
             
             // Check if this is a known nutrient
             const nutrientName = nutrientNameMap[externalId];
@@ -1002,159 +1546,7 @@ function parseNutrition($: cheerio.CheerioAPI): Nutrition | null {
       }
     }
   } catch (e) {
-    // Continue to __NEXT_DATA__
-  }
-  
-  // Second, try to extract from __NEXT_DATA__
-  // Kraft Heinz uses Next.js and embeds product data (including nutrition) in the page
-  try {
-    const nextDataScript = $('script#__NEXT_DATA__').html();
-    if (nextDataScript) {
-      const nextData = JSON.parse(nextDataScript);
-      
-      // Search recursively for objects containing nutrition data (with items array and servingSize)
-      const findNutritionData = (obj: any, path: string = 'root'): { items: any[]; servingSize?: string; servingsPerContainer?: string } | null => {
-        if (!obj || typeof obj !== 'object') return null;
-        
-        // Check if this is an object with an items array containing nutrition fields
-        if (!Array.isArray(obj) && obj.items && Array.isArray(obj.items)) {
-          // Check if first item has the nutrition fields structure
-          if (obj.items.length > 0 && obj.items[0]?.fields?.externalId) {
-            const externalId = obj.items[0].fields.externalId;
-            if (externalId.includes('NUTRSRV1')) {
-              return {items: obj.items,
-                servingSize: obj.servingSize || undefined,
-                servingsPerContainer: obj.servingsPerContainer || undefined};
-            }
-          }
-        }
-        
-        // Check if this is an object with fields.items array (alternative structure)
-        if (!Array.isArray(obj) && obj.fields?.items && Array.isArray(obj.fields.items)) {
-          // Check if first item has the nutrition fields structure
-          if (obj.fields.items.length > 0 && obj.fields.items[0]?.fields?.externalId) {
-            const externalId = obj.fields.items[0].fields.externalId;
-            if (externalId.includes('NUTRSRV1')) {
-              return {items: obj.fields.items,
-                servingSize: obj.servingSize || obj.fields.servingSize || undefined,
-                servingsPerContainer: obj.servingsPerContainer || obj.fields.servingsPerContainer || undefined};
-            }
-          }
-        }
-        
-        // Check if this is an array of nutrition objects with fields (fallback for different structure)
-        if (Array.isArray(obj)) {
-          if (obj.length > 0 && obj[0]?.fields?.externalId) {
-            const externalId = obj[0].fields.externalId;
-            if (externalId.includes('NUTRSRV1')) {
-              return {items: obj};
-            }
-          }
-          // Also recursively search within array elements
-          for (let i = 0; i < Math.min(obj.length, 10); i++) { // Limit to first 10 to avoid performance issues
-            if (obj[i] && typeof obj[i] === 'object') {
-              const found = findNutritionData(obj[i], `${path}[${i}]`);
-              if (found) return found;
-            }
-          }
-          return null; // Don't continue with object key iteration for arrays
-        }
-        
-        // Recursively search nested objects/arrays
-        for (const key of Object.keys(obj)) {
-          if (obj[key] && typeof obj[key] === 'object') {
-            const found = findNutritionData(obj[key], `${path}.${key}`);
-            if (found) return found;
-          }
-        }
-        return null;
-      };
-      
-      const nutritionData = findNutritionData(nextData);
-      
-      if (nutritionData && nutritionData.items && nutritionData.items.length > 0) {
-        const nutritionArray = nutritionData.items;
-        let servingSize: string | null = nutritionData.servingSize || null;
-        let servingsPerContainer: string | null = nutritionData.servingsPerContainer || null;
-        let calories: string | null = null;
-        const nutrients: NutritionNutrient[] = [];
-        
-        // Map of externalId to nutrient name
-        const nutrientNameMap: { [key: string]: string } = {
-          'F_NUTRSRV1_FAT': 'Total Fat',
-          'F_NUTRSRV1_TOTFAT': 'Total Fat',
-          'F_NUTRSRV1_SATFAT': 'Saturated Fat',
-          'F_NUTRSRV1_FASAT': 'Saturated Fat',
-          'F_NUTRSRV1_TRNFAT': 'Trans Fat',
-          'F_NUTRSRV1_FATRN': 'Trans Fat',
-          'F_NUTRSRV1_CHOL': 'Cholesterol',
-          'F_NUTRSRV1_SOD': 'Sodium',
-          'F_NUTRSRV1_NA': 'Sodium',
-          'F_NUTRSRV1_TOTCARB': 'Total Carbohydrate',
-          'F_NUTRSRV1_CARB': 'Total Carbohydrate',
-          'F_NUTRSRV1_CHO': 'Total Carbohydrate',
-          'F_NUTRSRV1_FIBTSW': 'Dietary Fiber',
-          'F_NUTRSRV1_TOTSUG': 'Total Sugars',
-          'F_NUTRSRV1_SUGAR': 'Total Sugars',
-          'F_NUTRSRV1_ADDSUG': 'Added Sugars',
-          'F_NUTRSRV1_PRO': 'Protein',
-          'F_NUTRSRV1_VITD': 'Vitamin D',
-          'F_NUTRSRV1_CA': 'Calcium',
-          'F_NUTRSRV1_FE': 'Iron',
-          'F_NUTRSRV1_K': 'Potassium',
-        };
-        
-        // Process each nutrition field
-        for (const item of nutritionArray) {
-          const fields = item.fields || item;
-          const externalId = fields.externalId || fields.id;
-          const amount = fields.amount;
-          const dailyPercent = fields.dailyPercent || fields.dailyValue;
-          
-          if (!externalId) continue;
-          
-          // Check for serving size
-          if (externalId.includes('SERVSIZE') || externalId.includes('SERVSIZ')) {
-            servingSize = amount || null;
-            continue;
-          }
-          
-          // Check for servings per container
-          if (externalId.includes('SERVCON')) {
-            servingsPerContainer = amount || null;
-            continue;
-          }
-          
-          // Check for calories
-          if (externalId.includes('CALORIES') || externalId.includes('CAL')) {
-            calories = amount || null;
-            continue;
-          }
-          
-          // Check if this is a known nutrient
-          const nutrientName = nutrientNameMap[externalId];
-          if (nutrientName && amount) {
-            nutrients.push({
-              name: nutrientName,
-              amount: String(amount),
-              dailyValuePercent: dailyPercent ? String(dailyPercent) : null,
-            });
-          }
-        }
-          
-          if (servingSize || calories || nutrients.length > 0) {
-            return {
-              servingSize: servingSize ? normalizeWhitespace(servingSize) : null,
-              servingsPerContainer: servingsPerContainer ? normalizeWhitespace(servingsPerContainer) : null,
-              calories,
-              nutrients,
-              rawText: `Found ${nutrients.length} nutrients from __NEXT_DATA__`,
-            };
-          }
-      }
-    }
-  } catch (e) {
-    console.log('Error in __NEXT_DATA__ nutrition extraction:', e);
+    // Continue to DOM parsing
   }
   
   // Fallback: Try to locate a "Nutrition Facts" block and parse common fields.
@@ -1253,7 +1645,7 @@ async function scrapeListing(browser: Browser, brandCfg: BrandConfig): Promise<s
   }
 }
 
-async function scrapeProductDetail(browser: Browser, brandCfg: BrandConfig, productUrl: string): Promise<ScrapedProduct> {
+async function scrapeProductDetail(browser: Browser, brandCfg: BrandConfig, productUrl: string): Promise<ScrapedProduct | null> {
   const page = await browser.newPage();
   try {
     // Use domcontentloaded for better reliability
@@ -1263,6 +1655,37 @@ async function scrapeProductDetail(browser: Browser, brandCfg: BrandConfig, prod
     });
     // Wait for page to be ready (reduced timeout since we're using domcontentloaded)
     await page.waitForTimeout(1000);
+
+    // Early existence check before expanding accordions or fetching nutrition images
+    try {
+      const earlyHtml = await page.content();
+      const $early = cheerio.load(earlyHtml);
+      const earlyRawName = parseName($early);
+      const earlyName =
+        typeof cleanProductName === "function"
+          ? cleanProductName(earlyRawName, {
+              brand: brandCfg.brand,
+              decodeHtml: true,
+              stripBrandPrefix: true,
+              stripPipe: true,
+              stripTrailingDashSize: true,
+              stripTrailingCommaSize: true,
+            })
+          : earlyRawName;
+      const earlyUpc12 = extractUpc12FromNextData($early) || extractUpc12FromUrl(productUrl);
+
+      const exists = await checkProductExists({
+        name: earlyName,
+        brand: brandCfg.brand,
+        upc: earlyUpc12,
+      });
+      if (exists) {
+        console.log(`[SKIP] ${brandCfg.brand} ${earlyName ?? "(no name)"}: already exists`);
+        return null;
+      }
+    } catch (e) {
+      if (DEBUG_KH) console.log("[DEBUG] early existence check failed:", e);
+    }
 
     // Try to click on accordion/tab sections to reveal hidden content
     // Look for "Nutrition", "Ingredients", "Allergen" buttons/links
@@ -1291,22 +1714,49 @@ async function scrapeProductDetail(browser: Browser, brandCfg: BrandConfig, prod
     ]);
     
     // Brief wait after clicking to allow content to load
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(1000);
+    await page
+      .waitForSelector("img[data-testid='or-product-accordion-nutritional-image']", { timeout: 1500 })
+      .catch(() => {});
 
     const html = await page.content();
     const $ = cheerio.load(html);
 
-    const name = parseName($);
+    const rawName = parseName($);
+    const name =
+      typeof cleanProductName === "function"
+        ? cleanProductName(rawName, {
+            brand: brandCfg.brand,
+            decodeHtml: true,
+            stripBrandPrefix: true,
+            stripPipe: true,
+            stripTrailingDashSize: true,
+            stripTrailingCommaSize: true,
+          })
+        : rawName;
     const ingredients = parseIngredients($);
+    const allergens = parseAllergens($);
     const imageUrl = parseImageUrl($, productUrl);
+    const nutritionImageUrl = $("img[data-testid='or-product-accordion-nutritional-image']").attr("src") || null;
+    if (DEBUG_KH) {
+      console.log(`[DEBUG] nutrition image url: ${nutritionImageUrl ?? "(null)"}`);
+    }
 
-    // UPC: Try JSON-LD first (most reliable), then URL, then fallback to page text
-    const upc12FromJsonLd = extractUpc12FromJsonLd($);
-    const upc12FromUrl = upc12FromJsonLd ? null : extractUpc12FromUrl(productUrl);
-    const upc12FromPage = (upc12FromJsonLd || upc12FromUrl) ? null : extractUpc12FromText(normalizeWhitespace($("body").text()));
-    const upc12 = upc12FromJsonLd ?? upc12FromUrl ?? upc12FromPage;
+    // UPC: Try __NEXT_DATA__ first, then JSON-LD, then URL, then fallback to page text
+    const upc12FromNextData = extractUpc12FromNextData($);
+    const upc12FromJsonLd = upc12FromNextData ? null : extractUpc12FromJsonLd($);
+    const upc12FromUrl = (upc12FromNextData || upc12FromJsonLd) ? null : extractUpc12FromUrl(productUrl);
+    const upc12FromPage = (upc12FromNextData || upc12FromJsonLd || upc12FromUrl)
+      ? null
+      : extractUpc12FromText(normalizeWhitespace($("body").text()));
+    const upc12 = upc12FromNextData ?? upc12FromJsonLd ?? upc12FromUrl ?? upc12FromPage;
 
     const nutrition = parseNutrition($);
+    const nutritionFromDom = transformNutritionToDbFormat(nutrition);
+    const shouldUseImage =
+      !!nutritionImageUrl &&
+      (!nutritionFromDom || nutritionFromDom.added_sugars_g == null);
+    const nutritionData = shouldUseImage ? await fetchNutritionFromImage(nutritionImageUrl!) : null;
 
     // Extract source dates from __NEXT_DATA__
     const sourceDates = extractSourceDates($);
@@ -1321,8 +1771,11 @@ async function scrapeProductDetail(browser: Browser, brandCfg: BrandConfig, prod
 
       name,
       ingredients,
+      allergens,
       upc12,
       nutrition,
+      nutritionData,
+      nutritionImageUrl,
       imageUrl,
 
       scrapedAt,
@@ -1343,16 +1796,40 @@ async function scrapeProductDetail(browser: Browser, brandCfg: BrandConfig, prod
   }
 }
 
-/** Parse CLI args: config path (optional), --url, --limit N, --local */
-function parseKraftHeinzArgs(): { configPath?: string; url?: string; limit?: number; local: boolean } {
+/** Parse CLI args: similar to Amazon scraper style */
+function parseKraftHeinzArgs(): {
+  configPath?: string;
+  url?: string;
+  searchUrl?: string;
+  limit?: number;
+  offset: number;
+  local: boolean;
+  debug: boolean;
+  noHeadless: boolean;
+  headless: boolean;
+  concurrency: number;
+} {
   const argv = process.argv.slice(2);
-  let configPath: string | undefined;
+  const defaultConfig = path.resolve(__dirname, "./config.json");
+  let configPath: string | undefined = defaultConfig;
   let url: string | undefined;
+  let searchUrl: string | undefined;
   let limit: number | undefined;
+  let offset = 0;
   let local = false;
+  let debug = false;
+  let noHeadless = false;
+  let headless = false;
+  let concurrency = 6;
   for (let i = 0; i < argv.length; i++) {
     if ((argv[i] === "--url" || argv[i] === "-u") && argv[i + 1]) {
       url = argv[i + 1];
+      i++;
+    } else if ((argv[i] === "--search" || argv[i] === "-s") && argv[i + 1]) {
+      searchUrl = argv[i + 1];
+      i++;
+    } else if ((argv[i] === "--config" || argv[i] === "-c") && argv[i + 1]) {
+      configPath = path.resolve(argv[i + 1]);
       i++;
     } else if (argv[i] === "--limit" || argv[i] === "-l") {
       const n = parseInt(argv[i + 1], 10);
@@ -1360,35 +1837,51 @@ function parseKraftHeinzArgs(): { configPath?: string; url?: string; limit?: num
         limit = n;
         i++;
       }
+    } else if ((argv[i] === "--offset" || argv[i] === "-o") && argv[i + 1]) {
+      const n = parseInt(argv[i + 1], 10);
+      if (!isNaN(n) && n >= 0) offset = n;
+      i++;
     } else if (argv[i] === "--local") {
       local = true;
-    } else if (!argv[i].startsWith("-")) {
-      configPath = argv[i];
+    } else if ((argv[i] === "--debug" || argv[i] === "-d")) {
+      debug = true;
+    } else if (argv[i] === "--no-headless") {
+      noHeadless = true;
+    } else if (argv[i] === "--headless") {
+      headless = true;
+    } else if ((argv[i] === "--concurrency" || argv[i] === "-n") && argv[i + 1]) {
+      const n = parseInt(argv[i + 1], 10);
+      if (!isNaN(n) && n > 0) concurrency = n;
+      i++;
     }
   }
-  return { configPath, url, limit, local };
+  return { configPath, url, searchUrl, limit, offset, local, debug, noHeadless, headless, concurrency };
 }
 
 async function main(): Promise<void> {
-  const { configPath, url, limit: productLimit, local } = parseKraftHeinzArgs();
-  if (!configPath && !url) {
-    console.error("Usage: npx tsx scrape.ts ./brands.config.json [--limit N] [--local] | --url <productUrl> [--local]");
-    console.error("  --limit N   Scrape at most N products (default: no limit)");
-    console.error("  --local     Skip AWS (DynamoDB, S3) and API submission; run scraping only");
+  const { configPath, url, searchUrl, limit: productLimit, offset, local, debug, noHeadless, headless, concurrency } =
+    parseKraftHeinzArgs();
+  if (!configPath && !url && !searchUrl) {
+    console.error("Usage: npx tsx scrape.ts --config ./config.json [--limit N] [--offset N] [--local]");
+    console.error("   or: npx tsx scrape.ts --url <productUrl> [--local]");
+    console.error("   or: npx tsx scrape.ts --search <listingUrl> [--local]");
     process.exit(1);
   }
 
   const cfg = configPath ? (JSON.parse(fs.readFileSync(configPath, "utf8")) as AppConfig) : null;
 
-  if (cfg && (!Array.isArray(cfg.brands) || cfg.brands.length === 0)) {
-    throw new Error("Invalid config: must include non-empty brands[]");
-  }
+  DEBUG_KH = debug || DEBUG_KH;
+  if (noHeadless) KRAFT_HEADLESS = false;
+  if (headless) KRAFT_HEADLESS = true;
 
   if (local) {
     console.log("Running in local mode: skipping DynamoDB job status and S3 upload; API submission still runs (use AWS profile for SSM).");
   }
   if (productLimit != null) {
     console.log(`Limit: scraping at most ${productLimit} products.`);
+  }
+  if (offset > 0) {
+    console.log(`Offset: skipping first ${offset} products.`);
   }
 
   const jobId = uuidv4();
@@ -1412,7 +1905,7 @@ async function main(): Promise<void> {
 
   // Optimize browser launch for Docker/ECS environment
   const browser = await chromium.launch({
-    headless: true,
+    headless: KRAFT_HEADLESS,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -1441,41 +1934,77 @@ async function main(): Promise<void> {
   });
 
   try {
-    // 1) Discover product detail URLs for each brand
+    // 1) Discover product detail URLs
     const allTargets: Array<{ brandCfg: BrandConfig; url: string }> = [];
+
+    const defaultBrand = cfg?.brand || "Kraft Heinz";
+    const defaultSource = cfg?.source || "kraftheinz";
 
     if (url) {
       allTargets.push({
-        brandCfg: { brand: "Kraft Heinz", source: "kraftheinz", listingUrl: "" },
+        brandCfg: { brand: defaultBrand, source: defaultSource, listingUrl: "" },
         url,
       });
-    } else if (cfg) {
-      for (const brandCfg of cfg.brands) {
-        if (productLimit != null && allTargets.length >= productLimit) break;
+    } else {
+      const searchTargets: Array<{ url: string; brand: string; source: string }> = [];
+      if (searchUrl) {
+        searchTargets.push({ url: searchUrl, brand: defaultBrand, source: defaultSource });
+      } else if (cfg?.searchUrls) {
+        for (const entry of cfg.searchUrls) {
+          if (typeof entry === "string") {
+            searchTargets.push({ url: entry, brand: defaultBrand, source: defaultSource });
+          } else if (entry && typeof entry.url === "string") {
+            searchTargets.push({
+              url: entry.url,
+              brand: entry.brand || defaultBrand,
+              source: entry.source || defaultSource,
+            });
+          }
+        }
+      }
+
+      if (cfg?.urls) {
+        for (const entry of cfg.urls) {
+          if (typeof entry === "string") {
+            allTargets.push({
+              brandCfg: { brand: defaultBrand, source: defaultSource, listingUrl: "" },
+              url: entry,
+            });
+          } else if (entry && typeof entry.url === "string") {
+            allTargets.push({
+              brandCfg: { brand: entry.brand || defaultBrand, source: entry.source || defaultSource, listingUrl: "" },
+              url: entry.url,
+            });
+          }
+        }
+      }
+
+      for (const target of searchTargets) {
+        if (productLimit != null && allTargets.length >= productLimit + offset) break;
+        const brandCfg: BrandConfig = { brand: target.brand, source: target.source, listingUrl: target.url };
         console.log(`\n[DISCOVER] ${brandCfg.brand}: ${brandCfg.listingUrl}`);
         const urls = await scrapeListing(browser, brandCfg);
         console.log(`[DISCOVER] ${brandCfg.brand}: ${urls.length} product URLs`);
         for (const u of urls) {
           allTargets.push({ brandCfg, url: u });
-          if (productLimit != null && allTargets.length >= productLimit) break;
+          if (productLimit != null && allTargets.length >= productLimit + offset) break;
         }
       }
     }
 
-    // Apply --limit: only scrape first N product URLs
-    const targets = productLimit != null ? allTargets.slice(0, productLimit) : allTargets;
+    const slicedTargets = allTargets.slice(offset, productLimit ? offset + productLimit : undefined);
     if (productLimit != null && allTargets.length > productLimit) {
-      console.log(`[LIMIT] Scraping ${targets.length} of ${allTargets.length} discovered URLs`);
+      console.log(`[LIMIT] Scraping ${slicedTargets.length} of ${allTargets.length} discovered URLs`);
     }
 
-    // 2) Scrape details with bounded concurrency
-    const concurrencyLimit = pLimit(Math.max(1, cfg?.concurrency ?? 4));
+    const concurrencyLimit = pLimit(Math.max(1, concurrency || cfg?.concurrency || 4));
 
     const results = await Promise.all(
-      targets.map(({ brandCfg, url }) =>
+      slicedTargets.map(({ brandCfg, url }) =>
         concurrencyLimit(async () => {
           try {
             const product = await scrapeProductDetail(browser, brandCfg, url);
+            if (!product) return null;
             console.log(`[OK] ${brandCfg.brand} ${product.upc12 ?? ""} ${product.name ?? ""}`.trim());
             return product;
           } catch (e: unknown) {
@@ -1489,7 +2018,7 @@ async function main(): Promise<void> {
 
     // Filter out errors and products without required fields
     const validProducts = results.filter(
-      (r) => !(r as any).error && r.name && r.ingredients
+      (r) => r && !(r as any).error && (r as ScrapedProduct).name && (r as ScrapedProduct).ingredients
     ) as ScrapedProduct[];
 
     console.log(`\nScraped ${validProducts.length} valid products out of ${results.length} total`);

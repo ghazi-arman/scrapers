@@ -120,6 +120,8 @@ export interface ScraperProductOutput {
   /** List of UPCs; first is primary. Used when product has multiple UPCs (e.g. Trader Joe's SKU-based). */
   upcs?: string[];
   ingredients_text: string;
+  /** Optional allergen statement, e.g. "Eggs, Milk, Peanuts" */
+  allergen_statement?: string;
   serving_size_value?: number | null;
   serving_size_unit?: string | null;
   serving_size_text?: string | null;

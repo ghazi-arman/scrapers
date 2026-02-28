@@ -11,7 +11,10 @@ import { DynamoDBDocumentClient, PutCommand, UpdateCommand } from "@aws-sdk/lib-
 import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 import { v4 as uuidv4 } from "uuid";
 import type { ScraperProductOutput, ScraperNutritionData } from "../shared-types";
+import * as nameUtils from "../name-utils";
 import * as nutritionUtils from "../nutrition-utils";
+import * as servingSizeUtils from "../serving-size-utils";
+import * as productIdUtils from "../product-id-utils";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -21,12 +24,21 @@ dotenv.config({ path: path.resolve(__dirname, ".env") });
 const parseNutrientAmountWithQualifier =
   (nutritionUtils as any).parseNutrientAmountWithQualifier ??
   (nutritionUtils as any).default?.parseNutrientAmountWithQualifier;
+const cleanProductName =
+  (nameUtils as any).cleanProductName ?? (nameUtils as any).default?.cleanProductName;
+const parseServingSizeFromText =
+  (servingSizeUtils as any).parseServingSizeFromText ??
+  (servingSizeUtils as any).default?.parseServingSizeFromText;
+const generateDeterministicProductId =
+  (productIdUtils as any).generateDeterministicProductId ??
+  (productIdUtils as any).default?.generateDeterministicProductId;
 
 const SOURCE = "samsclub.com";
 const SCRAPER_NAME = process.env.JOB_NAME || "sams-club";
 const SCRAPER_OUTPUTS_BUCKET = process.env.SCRAPER_OUTPUTS_BUCKET;
 const SCRAPER_JOB_STATUS_TABLE_NAME = process.env.SCRAPER_JOB_STATUS_TABLE_NAME;
-const API_BASE_URL = process.env.API_BASE_URL || "https://it7rdy3qbh.execute-api.us-west-2.amazonaws.com";
+const API_BASE_URL = process.env.API_BASE_URL || "https://api.mytummi.app";
+const PRODUCTS_API_URL = `${API_BASE_URL}/products`;
 const API_KEYS_PARAMETER_NAME = process.env.API_KEYS_PARAMETER_NAME || "/tummi/api-keys";
 const SCRAPEDO_TOKEN = process.env.SCRAPEDO_TOKEN || "";
 const SUBMIT_NUTRITION_PARSE_JOB_URL =
@@ -46,6 +58,28 @@ const docClient = DynamoDBDocumentClient.from(dynamoDbClient);
 const ssmClient = new SSMClient({});
 
 let serviceTokenCache: string | null = null;
+
+async function checkProductExists(params: {
+  name: string | null;
+  brand: string | null;
+  upc: string | null;
+}): Promise<boolean> {
+  const { name, brand, upc } = params;
+  if (!name || typeof generateDeterministicProductId !== "function") return false;
+  const productId = generateDeterministicProductId(name, brand || undefined, upc || undefined);
+  try {
+    const token = await getServiceToken();
+    const res = await axios.get(`${PRODUCTS_API_URL}/${productId}`, {
+      headers: { "X-Service-Token": token },
+      timeout: 10_000,
+    });
+    return !!res?.data;
+  } catch (e: any) {
+    if (e?.response?.status === 404) return false;
+    if (DEBUG_SAMS) console.log("[DEBUG] product exists check failed:", e);
+    return false;
+  }
+}
 
 type AppConfig = {
   urls?: string[];
@@ -70,6 +104,7 @@ type ScrapedProduct = {
   name: string | null;
   brand: string | null;
   ingredients: string | null;
+  allergens: string | null;
   upc12: string | null;
   nutrition: Nutrition | null;
   nutritionData: ScraperNutritionData | null;
@@ -168,39 +203,12 @@ function cleanText(s: string | null | undefined): string | null {
 }
 
 function parseServingSize(servingSizeText: string | null): { value: number | null; unit: string | null } {
-  if (!servingSizeText || typeof servingSizeText !== "string") {
-    return {value: null, unit: null};
+  if (typeof parseServingSizeFromText !== "function") {
+    throw new Error("parseServingSizeFromText import failed");
   }
-  const cleaned = servingSizeText.trim().replace(/\([^)]*\)/g, "").trim();
-
-  let match = cleaned.match(
-    /^(\d+)\/(\d+)\s+(Tbsp|tbsp|TSP|tsp|cup|cups|oz|fl\s*oz|floz|ml|g|kg|lb|lbs|serving|servings|pieces?|packets?)\b/i
-  );
-  if (match) {
-    const value = parseFloat(match[1]) / parseFloat(match[2]);
-    let unit = match[3].trim();
-    if (unit.toLowerCase() === "pieces") unit = "piece";
-    if (unit.toLowerCase() === "packets") unit = "packet";
-    return {value, unit};
-  }
-
-  match = cleaned.match(
-    /^(\d+(?:\.\d+)?)\s+(Tbsp|tbsp|TSP|tsp|cup|cups|oz|fl\s*oz|floz|ml|g|kg|lb|lbs|serving|servings|pieces?|packets?)\b/i
-  );
-  if (!match) match = cleaned.match(/^(\d+(?:\.\d+)?)(g|oz|ml)\b/i);
-  if (match) {
-    const value = parseFloat(match[1]);
-    let unit = (match[2] || "g").trim();
-    if (unit.toLowerCase() === "pieces") unit = "piece";
-    if (unit.toLowerCase() === "packets") unit = "packet";
-    return {value, unit};
-  }
-
-  const numMatch = cleaned.match(/^(\d+(?:\.\d+)?)/);
-  if (numMatch) return {value: parseFloat(numMatch[1]), unit: "serving"};
-
-  return {value: null, unit: null};
+  return parseServingSizeFromText(servingSizeText);
 }
+
 
 function extractJsonLd($: cheerio.CheerioAPI): any[] {
   const out: any[] = [];
@@ -270,12 +278,26 @@ function extractSearchResultRoot(nextData: any): any | null {
   return nextData?.props?.pageProps?.initialData?.searchResult || null;
 }
 
-function normalizeProductName(name: string | null): string | null {
-  if (!name) return null;
-  return name
-    .replace(/,\s*\d+\s*(pk|ct|count|pack)s?\.?$/i, "")
-    .replace(/,\s*\d+(?:\.\d+)?\s*(oz|fl\s*oz|lb|lbs|g|kg|ml)\b.*$/i, "")
-    .trim();
+function normalizeProductName(name: string | null, brand?: string | null): string | null {
+  return cleanProductName(name, {
+    brand: brand ?? undefined,
+    stripBrandPrefix: true,
+    stripPipe: true,
+    stripTrailingCount: true,
+    stripTrailingWeight: true,
+    stripAfterWeight: true,
+  });
+}
+
+function isListingUrl(url: string): boolean {
+  try {
+    const u = new URL(url);
+    if (u.hostname !== "www.samsclub.com") return false;
+    const path = u.pathname.toLowerCase();
+    return path.includes("/browse/") || path.startsWith("/s/") || path.startsWith("/search/");
+  } catch {
+    return false;
+  }
 }
 
 function findObjectWithKeys(obj: any, keys: string[]): any | null {
@@ -324,6 +346,16 @@ function findNamedValue(obj: any, needle: string): string | null {
 }
 
 function extractIngredientsFromHtml($: cheerio.CheerioAPI): string | null {
+  const inlineLabel = $("p, span")
+    .filter((_, el) => /ingredients\b/i.test($(el).text()) && $(el).find("strong").length > 0)
+    .toArray();
+  for (const el of inlineLabel) {
+    const $el = $(el);
+    const text = normalizeWhitespace($el.text());
+    const match = text.match(/ingredients\s*:?\s*(.+)$/i);
+    if (match?.[1]) return match[1].trim();
+  }
+
   const selectors = [
     "[data-testid='ingredients']",
     "[data-automation-id='ingredients']",
@@ -332,8 +364,18 @@ function extractIngredientsFromHtml($: cheerio.CheerioAPI): string | null {
     "[id*='ingredients']",
   ];
   for (const sel of selectors) {
-    const text = cleanText($(sel).text());
-    if (text && /ingredient/i.test(text)) return text.replace(/^ingredients:?\s*/i, "");
+    const node = $(sel).first();
+    if (!node.length) continue;
+    const labeledChild = node
+      .find("p, span")
+      .filter((_, el) => /ingredients\b/i.test($(el).text()) && $(el).find("strong").length > 0)
+      .first();
+    if (labeledChild.length) {
+      const text = normalizeWhitespace(labeledChild.text());
+      const match = text.match(/ingredients\s*:?\s*(.+)$/i);
+      if (match?.[1]) return match[1].trim();
+      continue;
+    }
   }
   return null;
 }
@@ -344,9 +386,77 @@ function extractIngredientsFromSpecifications(specs: any[]): string | null {
     const value = cleanText(spec?.value || null);
     if (!value || !/ingredients/i.test(value)) continue;
     const $ = cheerio.load(value);
+    const labeled = $("p, span")
+      .filter((_, el) => /ingredients\b/i.test($(el).text()) && $(el).find("strong").length > 0)
+      .first();
+    if (labeled.length) {
+      const text = normalizeWhitespace(labeled.text());
+      const match = text.match(/ingredients\s*:?\s*(.+)$/i);
+      if (match?.[1]) return match[1].trim();
+    }
     const text = normalizeWhitespace($.text());
-    const match = text.match(/Ingredients:\s*(.+)$/i);
-    if (match) return match[1].trim();
+    let extracted = text.replace(/^[^:]{0,80}\bingredients\s*:\s*/i, "");
+    if (extracted) return extracted;
+  }
+  return null;
+}
+
+function extractAllergensFromText(raw: string | null): string | null {
+  if (!raw) return null;
+  const $ = cheerio.load(raw);
+  const text = $.text();
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => normalizeWhitespace(l))
+    .filter(Boolean);
+  const statements: string[] = [];
+  const extraLines: string[] = [];
+
+  for (const line of lines) {
+    if (/^contains\b/i.test(line)) {
+      if (/bioengineered\s+food\s+ingredient/i.test(line)) continue;
+      const value = line.replace(/^contains\s*:?\s*/i, "").trim();
+      if (value) statements.push(`Contains ${value}`);
+    } else if (/^may\s*contain\b/i.test(line)) {
+      if (/may\s*contain\s+bacteria/i.test(line)) continue;
+      statements.push(line);
+    } else if (/^allergy\s*information\b/i.test(line) || /^allergen\s*information\b/i.test(line)) {
+      let value = line
+        .replace(/^allergy\s*information\s*:?\s*/i, "")
+        .replace(/^allergen\s*information\s*:?\s*/i, "")
+        .trim();
+      value = value.replace(/^contains\s*/i, "");
+      if (value) statements.push(`Contains ${value}`);
+    }
+  }
+
+  const merged = [...statements, ...extraLines].filter(Boolean);
+  if (merged.length === 0) return null;
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+  for (const s of merged) {
+    const normalized = normalizeWhitespace(s)
+      .replace(/[.!?]+$/g, "")
+      .toLowerCase();
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    deduped.push(s);
+  }
+  return deduped
+    .map((s) => (/[.!?]$/.test(s) ? s : `${s}.`))
+    .join(" ")
+    .trim();
+}
+
+function extractAllergensFromSpecifications(specs: any[]): string | null {
+  if (!Array.isArray(specs)) return null;
+  for (const spec of specs) {
+    const rawValue = spec?.value || null;
+    if (!rawValue) continue;
+    const valueText = cleanText(rawValue);
+    if (!valueText || !/contains|may\s*contain|allergen|allergy/i.test(valueText)) continue;
+    const allergens = extractAllergensFromText(rawValue) || extractAllergensFromText(valueText);
+    if (allergens) return allergens;
   }
   return null;
 }
@@ -358,13 +468,19 @@ function cleanIngredientsText(text: string | null): string | null {
   out = out.replace(/^[^:]{0,80}\bingredients\s*:\s*/i, "");
   // Remove trailing store/order instructions
   out = out.replace(/place your club pickup order.*$/i, "");
+  out = out.replace(/item is only available for curbside pickup.*$/i, "");
+  out = out.replace(/only available for curbside pickup.*$/i, "");
+  out = out.replace(/follow use-by date on label.*$/i, "");
+  out = out.replace(/perishable,?\s*keep refrigerated.*$/i, "");
+  out = out.replace(/resealable bottle.*$/i, "");
+  out = out.replace(/quantity:\s*[\d.]+\s*(fl\.?\s*oz|oz|lb|lbs|g|kg|ml|l)\b.*$/i, "");
+  out = out.replace(/net weight:\s*[\d.]+\s*(fl\.?\s*oz|oz|lb|lbs|g|kg|ml|l)\b.*$/i, "");
   // Remove safe handling guidance
   out = out.replace(/\b(safe handling|safe handling instructions)\b.*$/i, "");
   out = out.replace(/this product was prepared.*$/i, "");
   out = out.replace(/\bkeep refrigerated\b.*$/i, "");
-  // Trim anything after allergen "Contains:" statements
-  out = out.replace(/\bcontains\s*:\s*.*$/i, "");
-  out = out.replace(/\bcontains\s+[a-z0-9 ,&-]+\.\s*$/i, "");
+  // Remove standalone bioengineered statement
+  out = out.replace(/contains\s+a\s+bioengineered\s+food\s+ingredient\.?/i, "");
   out = normalizeWhitespace(out);
   return out || null;
 }
@@ -645,6 +761,7 @@ function transformToOutput(p: ScrapedProduct): ScraperProductOutput {
     brand: p.brand || "",
     upc: p.upc12 || undefined,
     ingredients_text: p.ingredients || "",
+    allergen_statement: p.allergens || undefined,
     serving_size_value: serving.value ?? undefined,
     serving_size_unit: serving.unit ?? undefined,
     serving_size_text: p.nutritionData?.serving_size_text || p.nutrition?.servingSize || undefined,
@@ -662,15 +779,23 @@ async function fetchHtml(url: string): Promise<string> {
   }
   const targetUrl = encodeURIComponent(url);
   const requestUrl = `http://api.scrape.do/?url=${targetUrl}&token=${SCRAPEDO_TOKEN}`;
-  const res = await axios.get(requestUrl, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
-      Accept: "text/html,application/xhtml+xml",
-      "Accept-Language": "en-US,en;q=0.9",
-    },
-    timeout: 60_000,
-  });
+  const headers = {
+    "User-Agent":
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
+    Accept: "text/html,application/xhtml+xml",
+    "Accept-Language": "en-US,en;q=0.9",
+  };
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  let res;
+  try {
+    res = await axios.get(requestUrl, { headers, timeout: 120_000 });
+  } catch (err: any) {
+    const isTimeout = err?.code === "ECONNABORTED" || /timeout/i.test(err?.message || "");
+    if (!isTimeout) throw err;
+    if (DEBUG_SAMS) console.log(`[DEBUG] scrape.do timeout; retrying once: ${url}`);
+    await sleep(2000);
+    res = await axios.get(requestUrl, { headers, timeout: 120_000 });
+  }
   if (typeof res.data === "string") return res.data;
   if (res.data && typeof res.data === "object") {
     const html =
@@ -883,7 +1008,7 @@ async function discoverProductUrlsFromSearch(listingUrl: string, limit?: number)
   return urls;
 }
 
-function extractFromNextData(nextData: any): { name?: string; brand?: string; upc?: string; image?: string; ingredients?: string; nutrition?: Nutrition | null } {
+function extractFromNextData(nextData: any): { name?: string; brand?: string; upc?: string; image?: string; ingredients?: string; allergens?: string; nutrition?: Nutrition | null } {
   if (!nextData) return {};
   const productCandidate =
     findObjectWithKeys(nextData, ["product"])?.product ||
@@ -897,6 +1022,9 @@ function extractFromNextData(nextData: any): { name?: string; brand?: string; up
   const upc = cleanText(rawProduct?.upc || rawProduct?.upc12 || rawProduct?.gtin || null) || undefined;
   const image = cleanText(rawProduct?.image || rawProduct?.imageUrl || rawProduct?.primaryImage || null) || undefined;
   const ingredients = cleanText(rawProduct?.ingredients || rawProduct?.ingredientStatement || null) || undefined;
+  const allergens =
+    cleanText(rawProduct?.allergens || rawProduct?.allergenInformation || rawProduct?.allergenStatement || null) ||
+    undefined;
 
   const nutritionFacts =
     rawProduct?.nutritionFacts ||
@@ -912,7 +1040,7 @@ function extractFromNextData(nextData: any): { name?: string; brand?: string; up
     if (Array.isArray(factsArray)) nutrition = nutritionFromFactsList(factsArray);
   }
 
-  return { name, brand, upc, image, ingredients, nutrition };
+  return { name, brand, upc, image, ingredients, allergens, nutrition };
 }
 
 async function scrapeProduct(url: string): Promise<ScrapedProduct | null> {
@@ -931,10 +1059,6 @@ async function scrapeProduct(url: string): Promise<ScrapedProduct | null> {
   const nextData = extractNextData($);
   const nextExtracted = extractFromNextData(nextData);
 
-  const nameRaw =
-    cleanText(nextExtracted.name) ||
-    cleanText(jsonLdProduct?.name || $("h1").first().text() || null);
-  const name = normalizeProductName(nameRaw);
   const brand =
     cleanText(nextExtracted.brand) ||
     cleanText(
@@ -942,6 +1066,10 @@ async function scrapeProduct(url: string): Promise<ScrapedProduct | null> {
         $('meta[property="og:site_name"]').attr("content") ||
         null
     );
+  const nameRaw =
+    cleanText(nextExtracted.name) ||
+    cleanText(jsonLdProduct?.name || $("h1").first().text() || null);
+  const name = normalizeProductName(nameRaw, brand);
   const specs = extractNextDataRoot(nextData)?.idml?.specifications || [];
   const ingredientsRaw =
     cleanText(nextExtracted.ingredients) ||
@@ -949,16 +1077,31 @@ async function scrapeProduct(url: string): Promise<ScrapedProduct | null> {
     cleanText(jsonLdProduct?.ingredients || jsonLdProduct?.ingredientStatement || null) ||
     extractIngredientsFromHtml($);
   const ingredients = cleanIngredientsText(ingredientsRaw);
+  if (DEBUG_SAMS) {
+    console.log(`[DEBUG] ingredientsRaw=${ingredientsRaw ?? "(null)"}`);
+  }
+  const allergensFromSpecs = extractAllergensFromSpecifications(specs);
+  const allergensFromContainer = extractAllergensFromText(
+    $("#section-ingredients, #ingredients, [data-testid='ingredients'], [data-automation-id='ingredients'], .mv0")
+      .text() || null
+  );
+  const allergensFromIngredients = extractAllergensFromText(ingredientsRaw);
+  const allergens =
+    cleanText(nextExtracted.allergens) ||
+    allergensFromSpecs ||
+    allergensFromContainer ||
+    allergensFromIngredients ||
+    null;
+  if (DEBUG_SAMS) {
+    console.log(`[DEBUG] allergensFromSpecs=${allergensFromSpecs ?? "(null)"}`);
+    console.log(`[DEBUG] allergensFromContainer=${allergensFromContainer ?? "(null)"}`);
+    console.log(`[DEBUG] allergensFromIngredients=${allergensFromIngredients ?? "(null)"}`);
+  }
   const nutrition =
     nextExtracted.nutrition ||
     nutritionFromJsonLd(jsonLdProduct?.nutrition || jsonLdProduct?.nutritionInformation || null);
   let nutritionImageUrl = findNamedValue(extractNextDataRoot(nextData), "nutrition") || null;
   const carouselImages = extractCarouselImagesFromNextData(nextData);
-  if (!nutritionImageUrl && carouselImages.length > 0) {
-    if (DEBUG_SAMS) console.log("[DEBUG] no nutrition image in data; probing carousel images via OCR");
-    nutritionImageUrl = await detectNutritionImageFromCarousel(carouselImages);
-  }
-  const nutritionData = nutritionImageUrl ? await fetchNutritionFromImage(nutritionImageUrl) : null;
   const imageUrl =
     cleanText(nextExtracted.image) ||
     cleanText(jsonLdProduct?.image || jsonLdProduct?.imageUrl || null) ||
@@ -968,10 +1111,24 @@ async function scrapeProduct(url: string): Promise<ScrapedProduct | null> {
     extractUpcFromText(JSON.stringify(jsonLdProduct || {})) ||
     extractUpcFromText(html);
 
+  // Early product existence check before OCR-heavy nutrition scanning
+  const exists = await checkProductExists({ name, brand, upc: upc12 });
+  if (exists) {
+    console.log(`[SKIP] ${brand ?? ""} ${name ?? "(no name)"}: already exists`.trim());
+    return null;
+  }
+
+  if (!nutritionImageUrl && carouselImages.length > 0) {
+    if (DEBUG_SAMS) console.log("[DEBUG] no nutrition image in data; probing carousel images via OCR");
+    nutritionImageUrl = await detectNutritionImageFromCarousel(carouselImages);
+  }
+  const nutritionData = nutritionImageUrl ? await fetchNutritionFromImage(nutritionImageUrl) : null;
+
   if (DEBUG_SAMS) {
     console.log(`[DEBUG] name=${name ?? "(null)"}`);
     console.log(`[DEBUG] brand=${brand ?? "(null)"}`);
     console.log(`[DEBUG] ingredients=${ingredients ?? "(null)"}`);
+    console.log(`[DEBUG] allergens=${allergens ?? "(null)"}`);
     console.log(`[DEBUG] upc=${upc12 ?? "(null)"}`);
     console.log(`[DEBUG] image=${imageUrl ?? "(null)"}`);
     console.log(`[DEBUG] nutritionImageUrl=${nutritionImageUrl ?? "(null)"}`);
@@ -984,6 +1141,7 @@ async function scrapeProduct(url: string): Promise<ScrapedProduct | null> {
     name,
     brand,
     ingredients,
+    allergens,
     upc12,
     nutrition,
     nutritionData,
@@ -1006,7 +1164,19 @@ async function getServiceToken(): Promise<string> {
 }
 
 async function submitProductForReview(productOutput: ScraperProductOutput): Promise<boolean> {
-  if (!productOutput.product_name || !productOutput.ingredients_text) return false;
+  if (!productOutput.product_name || !productOutput.ingredients_text) {
+    const missing = [
+      !productOutput.product_name ? "product_name" : null,
+      !productOutput.ingredients_text ? "ingredients_text" : null,
+    ].filter(Boolean);
+    console.error(
+      `❌ Failed "${productOutput.product_name ?? "(no name)"}": missing ${missing.join(", ")}`
+    );
+    if (DEBUG_SAMS) {
+      console.log(`[DEBUG] submit skipped for url=${productOutput.product_url ?? "(no url)"}`);
+    }
+    return false;
+  }
   try {
     const token = await getServiceToken();
     const { scraper_job_id: _, ...body } = productOutput as any;
@@ -1023,8 +1193,17 @@ async function submitProductForReview(productOutput: ScraperProductOutput): Prom
     console.error(`❌ Failed "${productOutput.product_name}": HTTP ${res.status}`);
     return false;
   } catch (err: unknown) {
-    const e = err as { response?: { status?: number; statusText?: string }; message?: string };
-    console.error(`❌ Failed "${productOutput.product_name}":`, e.response ? `${e.response.status} ${e.response.statusText}` : e.message);
+    const e = err as {
+      response?: { status?: number; statusText?: string; data?: unknown };
+      message?: string;
+    };
+    console.error(
+      `❌ Failed "${productOutput.product_name}":`,
+      e.response ? `${e.response.status} ${e.response.statusText}` : e.message
+    );
+    if (DEBUG_SAMS && e.response?.data) {
+      console.log(`[DEBUG] submit error body: ${JSON.stringify(e.response.data, null, 2)}`);
+    }
     return false;
   }
 }
@@ -1067,19 +1246,25 @@ function loadConfig(configPath?: string): AppConfig {
 function parseArgs() {
   const argv = process.argv.slice(2);
   let url: string | undefined;
+  let searchUrl: string | undefined;
   let configPath: string | undefined;
   let limit: number | undefined;
   let offset: number | undefined;
   let local = false;
   let concurrency = 5;
   let debug = false;
+  let noHeadless = false;
+  let headless = false;
 
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === "--url" || argv[i] === "-u") {
       url = argv[i + 1];
       i += 1;
+    } else if ((argv[i] === "--search" || argv[i] === "-s") && argv[i + 1]) {
+      searchUrl = argv[i + 1];
+      i += 1;
     } else if (argv[i] === "--config" || argv[i] === "-c") {
-      configPath = argv[i + 1];
+      configPath = path.resolve(argv[i + 1]);
       i += 1;
     } else if ((argv[i] === "--limit" || argv[i] === "-l") && argv[i + 1]) {
       const n = parseInt(argv[i + 1], 10);
@@ -1091,20 +1276,27 @@ function parseArgs() {
       i += 1;
     } else if (argv[i] === "--local") {
       local = true;
-    } else if (argv[i] === "--concurrency" && argv[i + 1]) {
+    } else if ((argv[i] === "--concurrency" || argv[i] === "-n") && argv[i + 1]) {
       const n = parseInt(argv[i + 1], 10);
       if (!isNaN(n)) concurrency = n;
       i += 1;
-    } else if (argv[i] === "--debug") {
+    } else if (argv[i] === "--debug" || argv[i] === "-d") {
       debug = true;
+    } else if (argv[i] === "--no-headless") {
+      noHeadless = true;
+    } else if (argv[i] === "--headless") {
+      headless = true;
     }
   }
-  return { url, configPath, limit, offset, local, concurrency, debug };
+  return { url, searchUrl, configPath, limit, offset, local, concurrency, debug, noHeadless, headless };
 }
 
 async function main() {
-  const { url, configPath, limit, offset, local, concurrency, debug } = parseArgs();
+  const { url, searchUrl, configPath, limit, offset, local, concurrency, debug, noHeadless, headless } = parseArgs();
   DEBUG_SAMS = debug || process.env.DEBUG_SAMS === "1";
+  if (noHeadless || headless) {
+    if (DEBUG_SAMS) console.log("[DEBUG] headless flags provided; Sam's Club scraper does not use a browser directly.");
+  }
 
   if (local) {
     console.log("Running in local mode: skipping DynamoDB and S3; API submission still runs.");
@@ -1118,8 +1310,14 @@ async function main() {
 
   const config = loadConfig(configPath);
   let urls: string[] = [];
-  if (url) {
-    urls = [url];
+  const effectiveUrl = searchUrl || url;
+  if (effectiveUrl) {
+    if (effectiveUrl && isListingUrl(effectiveUrl)) {
+      const targetCount = limit != null ? limit + (offset ?? 0) : undefined;
+      urls = await discoverProductUrlsFromSearch(effectiveUrl, targetCount);
+    } else if (effectiveUrl) {
+      urls = [effectiveUrl];
+    }
   } else if (config.urls?.length) {
     urls = config.urls;
   } else if (config.searchUrls?.length) {
@@ -1145,7 +1343,34 @@ async function main() {
 
   console.log(`Processing ${urls.length} product URLs`);
   const limiter = pLimit(concurrency);
-  const results = await Promise.all(
+  const results: ScraperProductOutput[] = [];
+  let submitted = 0;
+  let failed = 0;
+  let submitQueue = Promise.resolve();
+  let pendingBatch: ScraperProductOutput[] = [];
+
+  const flushBatch = (batch: ScraperProductOutput[]) => {
+    submitQueue = submitQueue.then(async () => {
+      const batchNumber = Math.max(1, Math.floor((submitted + failed) / 10) + 1);
+      const totalBatches = Math.max(1, Math.ceil((results.length + pendingBatch.length) / 10));
+      console.log(`\n➡️  Submitting batch ${batchNumber}/${totalBatches} (${batch.length} items)`);
+      const outcomes = await Promise.all(batch.map((prod) => submitProductForReview(prod)));
+      for (const ok of outcomes) {
+        if (ok) submitted += 1;
+        else failed += 1;
+      }
+    });
+  };
+
+  const enqueueForSubmit = (product: ScraperProductOutput) => {
+    pendingBatch.push(product);
+    while (pendingBatch.length >= 10) {
+      const batch = pendingBatch.splice(0, 10);
+      flushBatch(batch);
+    }
+  };
+
+  const scrapeResults = await Promise.all(
     urls.map((u) =>
       limiter(async () => {
         const product = await scrapeProduct(u);
@@ -1156,12 +1381,14 @@ async function main() {
           return null;
         }
         console.log(`[PRODUCT] OK | ${output.product_name} | ${u}`);
+        results.push(output);
+        enqueueForSubmit(output);
         return output;
       })
     )
   );
 
-  const filtered = results.filter(Boolean) as ScraperProductOutput[];
+  const filtered = scrapeResults.filter(Boolean) as ScraperProductOutput[];
   const jobId = uuidv4();
   const runDateTime = new Date().toISOString();
 
@@ -1169,14 +1396,15 @@ async function main() {
     await updateJobStatus(jobId, "RUNNING");
   }
 
-  console.log(`\n📤 Submitting ${filtered.length} products for review...`);
-  let submitted = 0;
-  let failed = 0;
-  for (const prod of filtered) {
-    const ok = await submitProductForReview(prod);
-    if (ok) submitted += 1;
-    else failed += 1;
+  if (filtered.length > 0) {
+    console.log(`\n📤 Submitting in batches of 10 as products complete...`);
   }
+
+  if (pendingBatch.length > 0) {
+    const remaining = pendingBatch.splice(0, pendingBatch.length);
+    flushBatch(remaining);
+  }
+  await submitQueue;
 
   if (!local) {
     await uploadToS3(filtered, jobId, runDateTime);

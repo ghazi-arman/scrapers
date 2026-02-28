@@ -1,3 +1,6 @@
+const parseServingSizeFromText =
+  (servingSizeUtils as any).parseServingSizeFromText ??
+  (servingSizeUtils as any).default?.parseServingSizeFromText;
 /**
  * Trader Joe's product processor
  *
@@ -24,13 +27,23 @@ import { DynamoDBDocumentClient, PutCommand, UpdateCommand } from "@aws-sdk/lib-
 import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 import { v4 as uuidv4 } from "uuid";
 import type { ScraperProductOutput, ScraperNutritionData } from "../shared-types";
+import * as servingSizeUtils from "../serving-size-utils";
+import * as nameUtils from "../name-utils";
+import * as productIdUtils from "../product-id-utils";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const cleanProductName =
+  (nameUtils as any).cleanProductName ?? (nameUtils as any).default?.cleanProductName;
+const generateDeterministicProductId =
+  (productIdUtils as any).generateDeterministicProductId ??
+  (productIdUtils as any).default?.generateDeterministicProductId;
 
 interface TraderJoesProduct {
   sku: string;
   item_title: string;
+  source_url?: string;
   ingredients: Array<{ ingredient: string }>;
+  allergen_statement?: string;
   nutrition?: Array<{
     serving_size?: string;
     [key: string]: unknown;
@@ -63,10 +76,11 @@ const ssmClient = new SSMClient({});
 const SCRAPER_NAME = process.env.JOB_NAME || "trader-joes";
 const SCRAPER_OUTPUTS_BUCKET = process.env.SCRAPER_OUTPUTS_BUCKET;
 const SCRAPER_JOB_STATUS_TABLE_NAME = process.env.SCRAPER_JOB_STATUS_TABLE_NAME;
-const API_BASE_URL = process.env.API_BASE_URL || "https://it7rdy3qbh.execute-api.us-west-2.amazonaws.com";
+const API_BASE_URL = process.env.API_BASE_URL || "https://api.mytummi.app";
+const PRODUCTS_API_URL = `${API_BASE_URL}/products`;
 const API_KEYS_PARAMETER_NAME = process.env.API_KEYS_PARAMETER_NAME || "/tummi/api-keys";
 let DEBUG_TJ = false;
-const TJ_HEADLESS = process.env.TJ_HEADLESS !== "0";
+let TJ_HEADLESS = process.env.TJ_HEADLESS !== "0";
 const TJ_USER_DATA_DIR = process.env.TJ_USER_DATA_DIR;
 
 let serviceTokenCache: string | null = null;
@@ -85,6 +99,28 @@ async function getServiceToken(): Promise<string> {
   serviceTokenCache = parameter.InternalServiceToken;
   if (!serviceTokenCache) throw new Error("InternalServiceToken not found");
   return serviceTokenCache;
+}
+
+async function checkProductExists(params: {
+  name: string | null;
+  brand: string | null;
+  upc: string | null;
+}): Promise<boolean> {
+  const { name, brand, upc } = params;
+  if (!name || typeof generateDeterministicProductId !== "function") return false;
+  const productId = generateDeterministicProductId(name, brand || undefined, upc || undefined);
+  try {
+    const token = await getServiceToken();
+    const res = await axios.get(`${PRODUCTS_API_URL}/${productId}`, {
+      headers: { "X-Service-Token": token },
+      timeout: 10_000,
+    });
+    return !!res?.data;
+  } catch (e: any) {
+    if (e?.response?.status === 404) return false;
+    if (DEBUG_TJ) console.log("[DEBUG] product exists check failed:", e?.message || e);
+    return false;
+  }
 }
 
 /**
@@ -106,31 +142,13 @@ function normalizeUnit(unit: string): string {
   return map[unit.toLowerCase().trim()] ?? unit;
 }
 
-function parseServingSize(servingSizeStr: string): { value: number; unit: string } | null {
-  if (!servingSizeStr || typeof servingSizeStr !== "string") return null;
-  const trimmed = servingSizeStr.trim();
-  const fractionMatch = trimmed.match(/^(\d+)\s*\/\s*(\d+)\s*([a-zA-Z]+)/);
-  if (fractionMatch) {
-    const value = parseFloat(fractionMatch[1]) / parseFloat(fractionMatch[2]);
-    if (!isNaN(value)) return {value, unit: normalizeUnit(fractionMatch[3])};
+function parseServingSize(servingSizeText: string | null): { value: number | null; unit: string | null } {
+  if (typeof parseServingSizeFromText !== "function") {
+    throw new Error("parseServingSizeFromText import failed");
   }
-  const simpleMatch = trimmed.match(/^([\d.]+)\s+([a-zA-Z]+)/);
-  if (simpleMatch) {
-    const value = parseFloat(simpleMatch[1]);
-    if (!isNaN(value)) return {value, unit: normalizeUnit(simpleMatch[2])};
-  }
-  const parenMatch = trimmed.match(/\(([\d.]+)\s*([a-zA-Z]+)\)/);
-  if (parenMatch) {
-    const value = parseFloat(parenMatch[1]);
-    if (!isNaN(value)) return {value, unit: normalizeUnit(parenMatch[2])};
-  }
-  const compactMatch = trimmed.match(/^([\d.]+)([a-zA-Z]+)$/);
-  if (compactMatch) {
-    const value = parseFloat(compactMatch[1]);
-    if (!isNaN(value)) return {value, unit: normalizeUnit(compactMatch[2])};
-  }
-  return null;
+  return parseServingSizeFromText(servingSizeText);
 }
+
 
 function combineIngredients(ingredients: Array<{ ingredient: string }>): string {
   if (!ingredients?.length) return "";
@@ -250,6 +268,45 @@ function extractIngredientsFromSection($: cheerio.CheerioAPI): string | null {
 
   if (!parts.length) return null;
   return parts.join(", ");
+}
+
+function extractIngredientsAndAllergensFromSummary(
+  $: cheerio.CheerioAPI
+): { ingredients: string | null; allergens: string | null } {
+  const container = $("[class*='IngredientsSummary_ingredientsSummary__']").first();
+  if (!container.length) return { ingredients: null, allergens: null };
+
+  const allergenParts = container
+    .find("[class*='allergensList'] li, [class*='allergensListItem']")
+    .map((_, el) => $(el).text().trim())
+    .get()
+    .filter(Boolean);
+
+  const clone = container.clone();
+  clone.find("[class*='allergensList']").remove();
+  const ingredientListParts = clone
+    .find("[class*='IngredientsList_ingredientsList'] li, [class*='IngredientsList_ingredientsList__item']")
+    .map((_, el) => $(el).text().trim())
+    .get()
+    .filter(Boolean);
+
+  const ingredientsText =
+    (ingredientListParts.length > 0
+      ? ingredientListParts.join(", ")
+      : clone.text().replace(/\s+/g, " ").trim()) || null;
+
+  const allergensText =
+    allergenParts.length > 0
+      ? allergenParts
+          .map((part) => {
+            const trimmed = part.trim();
+            return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+          })
+          .join(" ")
+          .trim()
+      : null;
+
+  return { ingredients: ingredientsText, allergens: allergensText };
 }
 
 function extractNutritionFromText(text: string): TraderJoesProduct["nutrition_facts"] | null {
@@ -417,25 +474,6 @@ function mapNutrientToColumn(name: string): string | null {
 }
 
 async function fetchHtml(url: string): Promise<string> {
-  try {
-    const res = await axios.get(url, {
-      headers: {
-        "user-agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "accept-language": "en-US,en;q=0.9",
-        "cache-control": "no-cache",
-      },
-      timeout: 30_000,
-    });
-    if (DEBUG_TJ) console.log(`[DEBUG] fetch html via axios: ${url}`);
-    return res.data as string;
-  } catch (err: unknown) {
-    const e = err as { response?: { status?: number } };
-    if (e.response?.status !== 403) throw err;
-    if (DEBUG_TJ) console.log(`[DEBUG] axios 403, falling back to playwright: ${url}`);
-  }
-
   const launchOpts = {
     headless: TJ_HEADLESS,
   };
@@ -520,23 +558,41 @@ async function fetchProduct(url: string): Promise<TraderJoesProduct | null> {
     (productJson?.name as string | undefined) ||
     $('meta[property="og:title"]').attr("content") ||
     $("h1").first().text().trim();
-  if (DEBUG_TJ) console.log(`[DEBUG] name: ${name ?? "(null)"}`);
+  const cleanedName = name
+    ? typeof cleanProductName === "function"
+      ? cleanProductName(name, {
+          stripTrailingWeight: true,
+          stripTrailingCount: true,
+          stripTrailingDashSize: true,
+          stripParenAtEnd: true,
+          decodeHtml: true,
+        })
+      : name
+    : null;
+  if (DEBUG_TJ) console.log(`[DEBUG] name: ${cleanedName ?? "(null)"}`);
   if (name && /access denied/i.test(name)) {
     if (DEBUG_TJ) console.log(`[DEBUG] access denied title for ${url}`);
     return null;
   }
 
+  const summaryParsed = extractIngredientsAndAllergensFromSummary($);
   let ingredientsSource = "none";
-  let ingredientsText = extractIngredientsFromSection($) || "";
+  let ingredientsText = summaryParsed.ingredients || "";
+  let allergenStatement = summaryParsed.allergens || null;
   if (ingredientsText) {
-    ingredientsSource = "ingredients-section";
+    ingredientsSource = "ingredients-summary";
   } else {
-    ingredientsText = extractSectionText($, "Ingredients") || "";
+    ingredientsText = extractIngredientsFromSection($) || "";
     if (ingredientsText) {
-      ingredientsSource = "section-text";
-    } else if (typeof productJson?.ingredients === "string") {
-      ingredientsText = productJson.ingredients as string;
-      ingredientsSource = "jsonld";
+      ingredientsSource = "ingredients-section";
+    } else {
+      ingredientsText = extractSectionText($, "Ingredients") || "";
+      if (ingredientsText) {
+        ingredientsSource = "section-text";
+      } else if (typeof productJson?.ingredients === "string") {
+        ingredientsText = productJson.ingredients as string;
+        ingredientsSource = "jsonld";
+      }
     }
   }
   if (DEBUG_TJ) {
@@ -553,6 +609,13 @@ async function fetchProduct(url: string): Promise<TraderJoesProduct | null> {
         .filter(Boolean)
         .map((ingredient) => ({ ingredient }))
     : [];
+  if (!allergenStatement) {
+    allergenStatement =
+      extractSectionText($, "May Contain") ||
+      extractSectionText($, "Allergens") ||
+      extractSectionText($, "Allergen Information") ||
+      null;
+  }
 
   const nutritionFacts = extractNutritionFromDom($) || extractNutritionFromText($("body").text());
 
@@ -565,8 +628,10 @@ async function fetchProduct(url: string): Promise<TraderJoesProduct | null> {
 
   const product: TraderJoesProduct = {
     sku,
-    item_title: name || "",
+    item_title: cleanedName || "",
+    source_url: url,
     ingredients,
+    allergen_statement: allergenStatement || undefined,
     nutrition: undefined,
     serving_size_value: undefined,
     serving_size_unit: undefined,
@@ -621,8 +686,9 @@ function transformToScraperOutput(product: TraderJoesProduct): ScraperProductOut
     brand: "Trader Joe's",
     upcs,
     ingredients_text: combineIngredients(product.ingredients || []),
-    source: "trader_joes_api",
-    source_id: product.sku,
+    allergen_statement: product.allergen_statement || undefined,
+    source: SCRAPER_NAME,
+    source_id: product.source_url || product.sku,
     source_created_at: product.source_created_at || now,
     source_last_updated_at: product.source_last_updated_at || now,
     nutrition,
@@ -642,6 +708,9 @@ async function submitProductForReview(productOutput: ScraperProductOutput): Prom
   try {
     const token = await getServiceToken();
     const { scraper_job_id: _, ...body } = productOutput;
+    if (DEBUG_TJ) {
+      console.log(`[DEBUG] submit body: ${JSON.stringify(body, null, 2)}`);
+    }
     const res = await axios.post(`${API_BASE_URL}/submit-product-for-review`, body, {
       headers: { "Content-Type": "application/json", "X-Service-Token": token },
     });
@@ -694,8 +763,12 @@ function parseArgs() {
   let url: string | undefined;
   let searchUrl: string | undefined;
   let limit: number | undefined;
+  let offset = 0;
+  let concurrency = 5;
   let local = false;
   let debug = false;
+  let noHeadless = false;
+  let headless = false;
   for (let i = 0; i < argv.length; i++) {
     if ((argv[i] === "--url" || argv[i] === "-u") && argv[i + 1]) {
       url = argv[i + 1];
@@ -703,20 +776,32 @@ function parseArgs() {
     } else if ((argv[i] === "--search" || argv[i] === "-s") && argv[i + 1]) {
       searchUrl = argv[i + 1];
       i++;
-    } else if (argv[i] === "--config" && argv[i + 1]) {
+    } else if ((argv[i] === "--config" || argv[i] === "-c") && argv[i + 1]) {
       configPath = path.resolve(argv[i + 1]);
       i++;
     } else if ((argv[i] === "--limit" || argv[i] === "-l") && argv[i + 1]) {
       const n = parseInt(argv[i + 1], 10);
       if (!isNaN(n) && n > 0) limit = n;
       i++;
+    } else if ((argv[i] === "--offset" || argv[i] === "-o") && argv[i + 1]) {
+      const n = parseInt(argv[i + 1], 10);
+      if (!isNaN(n) && n >= 0) offset = n;
+      i++;
+    } else if ((argv[i] === "--concurrency" || argv[i] === "-n") && argv[i + 1]) {
+      const n = parseInt(argv[i + 1], 10);
+      if (!isNaN(n) && n > 0) concurrency = n;
+      i++;
     } else if (argv[i] === "--local") {
       local = true;
     } else if ((argv[i] === "--debug" || argv[i] === "-d")) {
       debug = true;
+    } else if (argv[i] === "--no-headless") {
+      noHeadless = true;
+    } else if (argv[i] === "--headless") {
+      headless = true;
     }
   }
-  return { url, searchUrl, configPath, limit, local, debug };
+  return { url, searchUrl, configPath, limit, offset, concurrency, local, debug, noHeadless, headless };
 }
 
 function normalizeTraderJoesUrl(href: string): string | null {
@@ -724,7 +809,42 @@ function normalizeTraderJoesUrl(href: string): string | null {
   if (href.startsWith("http")) return href;
   if (href.startsWith("//")) return `https:${href}`;
   if (href.startsWith("/")) return `https://www.traderjoes.com${href}`;
+  if (/^(home\/)?products\/pdp\//i.test(href)) return `https://www.traderjoes.com/${href.replace(/^\/+/, "")}`;
   return null;
+}
+
+function getCategoryPageFromUrl(categoryUrl: string): number {
+  try {
+    const u = new URL(categoryUrl);
+    const filtersRaw = u.searchParams.get("filters");
+    if (!filtersRaw) return 1;
+    const parsed = JSON.parse(filtersRaw) as { page?: number };
+    return Number.isFinite(parsed.page) && (parsed.page as number) > 0 ? (parsed.page as number) : 1;
+  } catch {
+    return 1;
+  }
+}
+
+function buildCategoryPageUrl(categoryUrl: string, pageNum: number): string {
+  const safePage = Math.max(1, Math.floor(pageNum));
+  try {
+    const u = new URL(categoryUrl);
+    const filtersRaw = u.searchParams.get("filters");
+    const filters: Record<string, unknown> = filtersRaw ? JSON.parse(filtersRaw) : {};
+    filters.page = safePage;
+    u.searchParams.set("filters", JSON.stringify(filters));
+    return u.toString();
+  } catch {
+    return categoryUrl;
+  }
+}
+
+function parsePageNumberFromLabel(label: string | null): number | null {
+  if (!label) return null;
+  const m = label.match(/\bpage\s+(\d+)\b/i);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  return Number.isFinite(n) && n > 0 ? n : null;
 }
 
 async function scrapeCategoryPage(categoryUrl: string, limit?: number): Promise<string[]> {
@@ -741,20 +861,102 @@ async function scrapeCategoryPage(categoryUrl: string, limit?: number): Promise<
   const page = await context.newPage();
   const seen = new Set<string>();
   let pageCount = 0;
+  let currentCategoryPage = getCategoryPageFromUrl(categoryUrl);
 
   try {
     await page.goto("https://www.traderjoes.com/home", { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
     await page.waitForTimeout(1500);
     await page.goto(categoryUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => {});
     await page.waitForTimeout(2000);
+    const initialTitle = (await page.title().catch(() => "")).trim();
+    if (/access denied/i.test(initialTitle)) {
+      console.error(`[DISCOVER] Access denied for category page: ${categoryUrl}`);
+      return [];
+    }
 
+    const dismiss = page.locator([
+      "button:has-text('Accept')",
+      "button:has-text('I Agree')",
+      "button[aria-label*='close' i]",
+      "button:has-text('Close')",
+    ].join(", ")).first();
+    if (await dismiss.count()) {
+      await dismiss.click({ timeout: 3000 }).catch(() => null);
+      await page.waitForTimeout(500);
+    }
+
+    const collectPageLinks = async (): Promise<string[]> => {
+      const productCardHits = await page.$$eval("a[href*='/home/products/pdp/']", (els) => {
+        const out: string[] = [];
+        for (const el of els) {
+          const href = (el as HTMLAnchorElement).getAttribute("href");
+          if (href && /(\/home)?\/products\/pdp\//i.test(href)) out.push(href);
+        }
+        return out;
+      });
+      const attrHits = await page.$$eval("a, [data-href], [data-url]", (els) => {
+        const out: string[] = [];
+        for (const el of els) {
+          const href = (el as HTMLAnchorElement).getAttribute("href");
+          const dataHref = el.getAttribute("data-href");
+          const dataUrl = el.getAttribute("data-url");
+          for (const v of [href, dataHref, dataUrl]) {
+            if (v && /(\/home)?\/products\/pdp\//i.test(v)) out.push(v);
+          }
+        }
+        return out;
+      });
+      const nextDataText = await page.locator("script#__NEXT_DATA__").first().textContent().catch(() => null);
+      const nextDataHits: string[] = [];
+      if (nextDataText) {
+        for (const m of nextDataText.matchAll(/"(?:\/home)?\/products\/pdp\/[^"?#]+"/gi)) {
+          nextDataHits.push(m[0].slice(1, -1));
+        }
+        const decoded = nextDataText.replace(/\\u002f/gi, "/");
+        for (const m of decoded.matchAll(/"(?:\/home)?\/products\/pdp\/[^"?#]+"/gi)) {
+          nextDataHits.push(m[0].slice(1, -1));
+        }
+      }
+      const html = await page.content();
+      const regexHits = Array.from(
+        html.matchAll(/["']((?:\/home)?\/products\/pdp\/[^"'?#]+)["']/gi),
+        (m) => m[1]
+      );
+      const escapedRegexHits = Array.from(
+        html.matchAll(/\\\/(?:home\\\/)?products\\\/pdp\\\/[^"'<\\\s?#]+/gi),
+        (m) => m[0].replace(/\\\//g, "/")
+      );
+      const unicodeEscapedHits = Array.from(
+        html.replace(/\\u002f/gi, "/").matchAll(/["']((?:\/home)?\/products\/pdp\/[^"'?#]+)["']/gi),
+        (m) => m[1]
+      );
+      if (DEBUG_TJ && pageCount === 1) {
+        await fs.writeFile("/tmp/traderjoes-category-page1.html", html).catch(() => null);
+        console.log(
+          `[DEBUG] link sources: productCards=${productCardHits.length} attr=${attrHits.length} nextData=${nextDataHits.length} regex=${regexHits.length} escaped=${escapedRegexHits.length} unicode=${unicodeEscapedHits.length}`
+        );
+      }
+      return [...productCardHits, ...attrHits, ...nextDataHits, ...regexHits, ...escapedRegexHits, ...unicodeEscapedHits];
+    };
+
+    let stagnantRounds = 0;
+    let lastSeenCount = 0;
     while (true) {
       pageCount++;
-      const links = await page.$$eval("a[href*='/home/products/pdp/']", (els) =>
-        els
-          .map((el) => (el as HTMLAnchorElement).getAttribute("href") || "")
-          .filter(Boolean)
-      );
+      let links = await collectPageLinks();
+      if (!links.length) {
+        await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => null);
+        await page.waitForTimeout(1500);
+        links = await collectPageLinks();
+      }
+      if (!links.length) {
+        const title = (await page.title().catch(() => "")).trim();
+        if (/access denied/i.test(title)) {
+          console.error(`[DISCOVER] Access denied while scraping: ${categoryUrl}`);
+          break;
+        }
+      }
       for (const href of links) {
         const full = normalizeTraderJoesUrl(href);
         if (!full) continue;
@@ -763,33 +965,51 @@ async function scrapeCategoryPage(categoryUrl: string, limit?: number): Promise<
       }
       console.log(`[DISCOVER] page ${pageCount}: ${seen.size} product urls collected`);
       if (limit && seen.size >= limit) break;
+      if (seen.size === lastSeenCount) stagnantRounds++;
+      else stagnantRounds = 0;
+      lastSeenCount = seen.size;
+      if (stagnantRounds >= 3) {
+        console.log("[DISCOVER] stopping pagination: no new product URLs after multiple pages");
+        break;
+      }
 
-      const nextLink = page.locator(
-        [
-          "a[rel='next']",
-          "a[aria-label*='Next']",
-          "button[aria-label*='Next']",
-          "a:has-text('→')",
-          "button:has-text('→')",
-        ].join(", ")
-      );
-      if (await nextLink.count()) {
-        const el = nextLink.first();
-        const disabled = await el.getAttribute("aria-disabled");
-        if (disabled === "true") break;
-        if (DEBUG_TJ) console.log("[DEBUG] clicking next page control");
-        await el.click({ timeout: 3000 }).catch(() => null);
-        await page.waitForTimeout(2000);
-        continue;
+      const pagination = page.locator(".Pagination_pagination__2zqib").first();
+      if (await pagination.count()) {
+        const nextButton = pagination.locator("button[aria-label^='Next page']").first();
+        if (await nextButton.count()) {
+          const isDisabled = await nextButton.isDisabled().catch(() => false);
+          const ariaDisabled = await nextButton.getAttribute("aria-disabled").catch(() => null);
+          if (isDisabled || ariaDisabled === "true") break;
+
+          const nextLabel = await nextButton.getAttribute("aria-label").catch(() => null);
+          const selectedLabel = await pagination
+            .locator("[aria-current='page']")
+            .first()
+            .getAttribute("aria-label")
+            .catch(() => null);
+          const selectedPage = parsePageNumberFromLabel(selectedLabel);
+          const nextPage = parsePageNumberFromLabel(nextLabel) ?? ((selectedPage ?? currentCategoryPage) + 1);
+          const nextUrl = buildCategoryPageUrl(categoryUrl, nextPage);
+
+          if (DEBUG_TJ) console.log(`[DEBUG] navigating category page by URL: ${nextUrl}`);
+          await page.goto(nextUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => null);
+          await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => null);
+          await page.waitForTimeout(1200);
+          currentCategoryPage = nextPage;
+          stagnantRounds = 0;
+          continue;
+        }
       }
 
       const nextHref = await page.$eval("a[rel='next']", (el) => (el as HTMLAnchorElement).href).catch(() => "");
       if (nextHref) {
         await page.goto(nextHref, { waitUntil: "domcontentloaded", timeout: 60_000 });
         await page.waitForTimeout(2000);
+        stagnantRounds = 0;
         continue;
       }
-      break;
+      if (stagnantRounds >= 3) break;
+      await page.waitForTimeout(1200);
     }
   } finally {
     await page.close().catch(() => null);
@@ -800,9 +1020,11 @@ async function scrapeCategoryPage(categoryUrl: string, limit?: number): Promise<
 }
 
 async function main(): Promise<void> {
-  const { url, searchUrl, configPath, limit, local, debug } = parseArgs();
+  const { url, searchUrl, configPath, limit, offset, concurrency, local, debug, noHeadless, headless } = parseArgs();
 
   DEBUG_TJ = debug;
+  if (noHeadless) TJ_HEADLESS = false;
+  if (headless) TJ_HEADLESS = true;
 
   if (local) {
     console.log("Running in local mode: skipping DynamoDB and S3; API submission still runs.");
@@ -810,6 +1032,10 @@ async function main(): Promise<void> {
   if (limit != null) {
     console.log(`Limit: processing at most ${limit} products.`);
   }
+  if (offset > 0) {
+    console.log(`Offset: skipping first ${offset} products.`);
+  }
+  const desiredCount = (limit ?? Number.POSITIVE_INFINITY) + (offset ?? 0);
 
   const jobId = uuidv4();
   const runDateTime = new Date().toISOString().replace(/[:.]/g, "-").slice(0, -5);
@@ -848,13 +1074,16 @@ async function main(): Promise<void> {
   if (searchUrls.length > 0) {
     const discovered: string[] = [];
     for (const su of searchUrls) {
-      const found = await scrapeCategoryPage(su, limit);
+      if (Number.isFinite(desiredCount) && discovered.length >= desiredCount) break;
+      const remaining = Number.isFinite(desiredCount) ? Math.max(desiredCount - discovered.length, 0) : undefined;
+      const found = await scrapeCategoryPage(su, remaining);
       discovered.push(...found);
-      if (limit && discovered.length >= limit) break;
+      if (Number.isFinite(desiredCount) && discovered.length >= desiredCount) break;
     }
-    urls = limit ? discovered.slice(0, limit) : discovered;
+    urls = discovered;
   }
 
+  if (offset > 0) urls = urls.slice(offset);
   if (limit != null) urls = urls.slice(0, limit);
   if (urls.length === 0) {
     console.error("No Trader Joe's product URLs found. Provide --url or config.json with urls/searchUrls.");
@@ -864,39 +1093,91 @@ async function main(): Promise<void> {
 
   const results: ScraperProductOutput[] = [];
   const valid: TraderJoesProduct[] = [];
-  for (const u of urls) {
-    const product = await fetchProduct(u);
-    if (!product) {
-      if (DEBUG_TJ) console.log(`[DEBUG] skipped ${u}: no product parsed`);
-      continue;
+  const submitBatch: ScraperProductOutput[] = [];
+  const SUBMIT_BATCH_SIZE = 10;
+  let scrapedCount = 0;
+  let submitted = 0;
+  let submitFailed = 0;
+
+  const flushSubmitBatch = async (force: boolean) => {
+    if (!force && submitBatch.length < SUBMIT_BATCH_SIZE) return;
+    if (!submitBatch.length) return;
+    const take = force ? submitBatch.length : Math.min(SUBMIT_BATCH_SIZE, submitBatch.length);
+    const batch = submitBatch.splice(0, take);
+    console.log(`\n➡️  Submitting batch (${batch.length} items)`);
+    for (const out of batch) {
+      const { scraper_job_id: _, ...body } = out;
+      const ok = await submitProductForReview(body);
+      if (ok) submitted++;
+      else submitFailed++;
     }
-    if (!product.item_title || (product.ingredients?.length ?? 0) === 0) {
-      if (DEBUG_TJ) {
-        console.log(
-          `[DEBUG] skipped ${u}: item_title=${product.item_title ? "yes" : "no"}, ingredients=${product.ingredients?.length ?? 0}`
-        );
+  };
+
+  let flushChain: Promise<void> = Promise.resolve();
+  const queueFlush = (force: boolean) => {
+    flushChain = flushChain.then(() => flushSubmitBatch(force)).catch((err) => {
+      console.error("[SUBMIT] batch flush failed:", err);
+    });
+    return flushChain;
+  };
+
+  const queue = [...urls];
+  const workerCount = Math.max(1, Math.min(concurrency || 5, queue.length));
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (queue.length) {
+      const u = queue.shift();
+      if (!u) break;
+      let product: TraderJoesProduct | null = null;
+      try {
+        product = await fetchProduct(u);
+      } catch (err) {
+        console.error(`[PRODUCT] Failed | ${u}`, err);
+        continue;
       }
-      continue;
+      if (!product) {
+        if (DEBUG_TJ) console.log(`[DEBUG] skipped ${u}: no product parsed`);
+        continue;
+      }
+      if (!product.item_title || (product.ingredients?.length ?? 0) === 0) {
+        if (DEBUG_TJ) {
+          console.log(
+            `[DEBUG] skipped ${u}: item_title=${product.item_title ? "yes" : "no"}, ingredients=${product.ingredients?.length ?? 0}`
+          );
+        }
+        continue;
+      }
+      const output = transformToScraperOutput(product);
+      const exists = await checkProductExists({
+        name: output.product_name || null,
+        brand: output.brand || null,
+        upc: output.upc || output.upcs?.[0] || null,
+      });
+      if (exists) {
+        console.log(`[SKIP] ${output.product_name || "(no name)"}: already exists`);
+        continue;
+      }
+      valid.push(product);
+      scrapedCount++;
+      if (scrapedCount % 10 === 0) {
+        console.log(`[PROGRESS] scraped ${scrapedCount} products`);
+      }
+      const outputWithJob = { ...output, scraper_job_id: jobId };
+      results.push(outputWithJob);
+      submitBatch.push(outputWithJob);
+      if (submitBatch.length >= SUBMIT_BATCH_SIZE) {
+        void queueFlush(false);
+      }
     }
-    valid.push(product);
-    const output = transformToScraperOutput(product);
-    results.push({ ...output, scraper_job_id: jobId });
-  }
+  });
+  await Promise.all(workers);
+  await queueFlush(true);
+  await flushChain;
 
   if (!local) {
     await uploadToS3(results, jobId, runDateTime);
   }
 
-  console.log(`\n📤 Submitting ${results.length} products for review...`);
-  let success = 0;
-  let fail = 0;
-  for (const r of results) {
-    const { scraper_job_id: _, ...body } = r;
-    const ok = await submitProductForReview(body);
-    if (ok) success++;
-    else fail++;
-  }
-  console.log(`\n📊 API: ${success} submitted, ${fail} failed`);
+  console.log(`\n📊 API: ${submitted} submitted, ${submitFailed} failed`);
 
   if (!local && SCRAPER_JOB_STATUS_TABLE_NAME) {
     if (valid.length === 0) {

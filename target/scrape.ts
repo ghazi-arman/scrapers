@@ -1,18 +1,28 @@
 import * as fs from "fs";
 import { chromium, type BrowserContext, type Browser, type Page } from "playwright";
 import * as cheerio from "cheerio";
-import pLimit from "p-limit";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 import { v4 as uuidv4 } from "uuid";
 import type { ScraperProductOutput, ScraperNutritionData } from "../shared-types";
+import * as nameUtils from "../name-utils";
 import * as nutritionUtils from "../nutrition-utils";
+import * as servingSizeUtils from "../serving-size-utils";
+import * as productIdUtils from "../product-id-utils";
 
 const parseNutrientAmountWithQualifier =
   (nutritionUtils as any).parseNutrientAmountWithQualifier ??
   (nutritionUtils as any).default?.parseNutrientAmountWithQualifier;
+const cleanProductName =
+  (nameUtils as any).cleanProductName ?? (nameUtils as any).default?.cleanProductName;
+const parseServingSizeFromText =
+  (servingSizeUtils as any).parseServingSizeFromText ??
+  (servingSizeUtils as any).default?.parseServingSizeFromText;
+const generateDeterministicProductId =
+  (productIdUtils as any).generateDeterministicProductId ??
+  (productIdUtils as any).default?.generateDeterministicProductId;
 
 type BrandConfig = {
   brand: string;
@@ -22,6 +32,8 @@ type BrandConfig = {
 type AppConfig = {
   urls?: string[];
   brands?: BrandConfig[];
+  categoryUrls?: string[];
+  skipListingUrls?: string[];
 };
 
 type NutritionNutrient = {
@@ -43,6 +55,7 @@ type ScrapedProduct = {
   productUrl: string;
   name: string | null;
   ingredients: string | null;
+  allergenStatement: string | null;
   upc12: string | null;
   nutrition: Nutrition | null;
   imageUrl: string | null;
@@ -55,10 +68,17 @@ const SOURCE = "target.com";
 const SCRAPER_NAME = process.env.JOB_NAME || "target";
 const SCRAPER_OUTPUTS_BUCKET = process.env.SCRAPER_OUTPUTS_BUCKET;
 const SCRAPER_JOB_STATUS_TABLE_NAME = process.env.SCRAPER_JOB_STATUS_TABLE_NAME;
-const API_BASE_URL = process.env.API_BASE_URL || "https://it7rdy3qbh.execute-api.us-west-2.amazonaws.com";
+const API_BASE_URL = process.env.API_BASE_URL || "https://api.mytummi.app";
+const PRODUCTS_API_URL = `${API_BASE_URL}/products`;
 const API_KEYS_PARAMETER_NAME = process.env.API_KEYS_PARAMETER_NAME || "/tummi/api-keys";
 const REDSKY_API_KEY = process.env.TARGET_REDSKY_API_KEY || "9f36aeafbe60771e321a7cc95a78140772ab3e96";
 const TARGET_STORE_ID = process.env.TARGET_STORE_ID || "305";
+const TARGET_CONTEXT_OPTIONS = {
+  userAgent:
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+  locale: "en-US",
+  viewport: { width: 1280, height: 720 },
+} as const;
 
 const s3Client = new S3Client({});
 const dynamoDbClient = new DynamoDBClient({});
@@ -66,43 +86,20 @@ const docClient = DynamoDBDocumentClient.from(dynamoDbClient);
 const ssmClient = new SSMClient({});
 
 let serviceTokenCache: string | null = null;
+let existingUpcSetPromise: Promise<Set<string>> | null = null;
+let apiKeysCache: Record<string, any> | null = null;
 
 function normalizeWhitespace(s: string): string {
   return s.replace(/\s+/g, " ").trim();
 }
 
 function parseServingSize(servingSizeText: string | null): { value: number | null; unit: string | null } {
-  if (!servingSizeText || typeof servingSizeText !== "string") {
-    return {value: null, unit: null};
+  if (typeof parseServingSizeFromText !== "function") {
+    throw new Error("parseServingSizeFromText import failed");
   }
-  const cleaned = servingSizeText.trim().replace(/\([^)]*\)/g, "").trim();
-
-  let match = cleaned.match(
-    /^(\d+)\/(\d+)\s+(Tbsp|tbsp|TSP|tsp|cup|cups|oz|fl\s*oz|floz|ml|g|kg|lb|lbs|serving|servings|crackers?)\b/i
-  );
-  if (match) {
-    const value = parseFloat(match[1]) / parseFloat(match[2]);
-    let unit = match[3].trim();
-    if (unit.toLowerCase() === "crackers") unit = "cracker";
-    return {value, unit};
-  }
-
-  match = cleaned.match(
-    /^(\d+(?:\.\d+)?)\s+(Tbsp|tbsp|TSP|tsp|cup|cups|oz|fl\s*oz|floz|ml|g|kg|lb|lbs|serving|servings|crackers?)\b/i
-  );
-  if (!match) match = cleaned.match(/^(\d+(?:\.\d+)?)(g|oz|ml)\b/i);
-  if (match) {
-    const value = parseFloat(match[1]);
-    let unit = (match[2] || "g").trim();
-    if (unit.toLowerCase() === "crackers") unit = "cracker";
-    return {value, unit};
-  }
-
-  const numMatch = cleaned.match(/^(\d+(?:\.\d+)?)/);
-  if (numMatch) return {value: parseFloat(numMatch[1]), unit: "serving"};
-
-  return {value: null, unit: null};
+  return parseServingSizeFromText(servingSizeText);
 }
+
 
 
 const NUTRIENT_COLUMN_MAP: Record<string, string> = {
@@ -144,6 +141,7 @@ const NUTRIENT_COLUMN_MAP: Record<string, string> = {
 
 function mapNutrientToColumn(name: string): string | null {
   const lower = name.toLowerCase().trim();
+  if (/\bpotas\.?\b/.test(lower)) return "potassium_mg";
   if (lower.includes("folic acid")) return "folic_acid_mcg";
   if (lower.includes("folate")) return "folate_mcg";
   for (const [key, col] of Object.entries(NUTRIENT_COLUMN_MAP)) {
@@ -173,7 +171,7 @@ function transformNutritionToDb(nutrition: Nutrition | null): ScraperNutritionDa
 
   for (const n of nutrition.nutrients || []) {
     const col = mapNutrientToColumn(n.name);
-    if (DEBUG_TARGET) {
+    if (DEBUG_PDP) {
       console.log(`[DEBUG] nutrition row: label="${n.name}" amount="${n.amount}" mapped="${col ?? "(none)"}"`);
     }
     if (col) {
@@ -287,6 +285,7 @@ let DEBUG_PDP = false;
 type ExtractResult = {
   name?: string;
   ingredients?: string;
+  allergenStatement?: string;
   nutrition?: Nutrition;
   imageUrl?: string;
   upc12?: string;
@@ -343,6 +342,15 @@ function extractFromPreloadedQueries(html: string): ExtractResult {
         const ing = findInObject(data, ["ingredients", "ingredient_information"]);
         if (typeof ing === "string") result.ingredients = normalizeWhitespace(ing);
       }
+      if (!result.allergenStatement) {
+        const allergens = findInObject(data, [
+          "allergens",
+          "allergen_information",
+          "allergens_and_warnings",
+          "allergenStatement",
+        ]);
+        if (typeof allergens === "string") result.allergenStatement = normalizeWhitespace(allergens);
+      }
       if (!result.nutrition) {
         const nd = findNutritionInNextData(data);
         if (nd) result.nutrition = nd;
@@ -360,6 +368,7 @@ function extractFromPreloadedQueries(html: string): ExtractResult {
 function extractFromRedskyPdp(data: unknown): {
   name?: string;
   ingredients?: string;
+  allergenStatement?: string;
   nutrition?: Nutrition;
   imageUrl?: string;
   upc12?: string;
@@ -367,6 +376,7 @@ function extractFromRedskyPdp(data: unknown): {
   const result: {
     name?: string;
     ingredients?: string;
+    allergenStatement?: string;
     nutrition?: Nutrition;
     imageUrl?: string;
     upc12?: string;
@@ -463,6 +473,16 @@ function extractFromRedskyPdp(data: unknown): {
     if (result.ingredients && result.nutrition) break;
   }
 
+  if (!result.allergenStatement) {
+    const allergens = findInObject(root, [
+      "allergens",
+      "allergen_information",
+      "allergens_and_warnings",
+      "allergenStatement",
+    ]);
+    if (typeof allergens === "string") result.allergenStatement = normalizeWhitespace(allergens);
+  }
+
   return result;
 }
 
@@ -510,6 +530,8 @@ function extractFromNextData(html: string): Partial<ScrapedProduct> {
 
     result.name = findString("title", "productTitle", "item", "name") || null;
     result.ingredients = findString("ingredients", "ingredient_information") || null;
+    result.allergenStatement =
+      findString("allergens", "allergen_information", "allergens_and_warnings", "allergenStatement") || null;
     result.imageUrl = findString("image", "primary_image", "default_image") || null;
 
     if (result.imageUrl && !result.imageUrl.startsWith("http")) {
@@ -551,6 +573,28 @@ function parseIngredientsFromDom($: cheerio.CheerioAPI): string | null {
   if (/whisk|griddle|waffle iron|do not overmix|pour about|bake until/i.test(cleaned)) return null;
 
   return cleaned;
+}
+
+function parseAllergenStatementFromDom($: cheerio.CheerioAPI): string | null {
+  const direct = normalizeWhitespace(
+    $("[data-test='productDetailTabs-nutritionFactsTab']")
+      .find("h4")
+      .filter((_, el) => /allergens?\s*&\s*warnings?/i.test(normalizeWhitespace($(el).text())))
+      .first()
+      .parent()
+      .text()
+      .replace(/Allergens?\s*&\s*Warnings?\s*:/i, "")
+  );
+  if (direct) return direct;
+
+  const raw = $("body").text().replace(/\u00a0/g, " ");
+  const block = sliceBetween(
+    raw,
+    /\bAllergens?\s*&\s*Warnings?\b\s*:?\s*/i,
+    [/\bSpecifications\b/i, /\bDescription\b/i, /\bAbout this item\b/i, /\bShipping\b/i]
+  );
+  if (!block) return null;
+  return normalizeWhitespace(block);
 }
 
 /**
@@ -664,11 +708,14 @@ async function ensurePdpExpanded(page: Page): Promise<void> {
   await page.waitForSelector("script#__NEXT_DATA__", { timeout: 5000 }).catch(() => {});
 }
 
-function extractBrandFromName(name: string | null): string | null {
-  if (!name) return null;
-  const parts = name.split(/\s+/);
-  if (parts.length >= 2 && /^[A-Z][a-zA-Z0-9]+$/.test(parts[0])) return parts[0];
-  return null;
+function parseBrandFromDom($: cheerio.CheerioAPI): string | null {
+  const raw =
+    $('a[data-test="shopAllBrandLink"] span').first().text().trim() ||
+    $('a[data-test="shopAllBrandLink"]').first().text().trim() ||
+    "";
+  if (!raw) return null;
+  const cleaned = raw.replace(/^shop\s+all\s+/i, "").replace(/\s+/g, " ").trim();
+  return cleaned || null;
 }
 
 function addImageParams(url: string | null): string | null {
@@ -701,15 +748,6 @@ function decodeHtmlEntities(input: string | null): string | null {
     .trim();
 }
 
-function stripBrandSuffix(name: string | null): string | null {
-  if (!name) return null;
-  const cleaned = name.trim();
-  const re =
-    /\s*[-–—]?\s*(Good\s*&\s*Gather|Favorite\s*Day)(?:™|TM)?\s*$/i;
-  const next = cleaned.replace(re, "").trim();
-  return next || cleaned;
-}
-
 function parseTcinFromUrl(url: string): string | null {
   const m = url.match(/\/A-(\d{8,})/);
   return m?.[1] ?? null;
@@ -731,28 +769,18 @@ function buildRedskyPdpClientUrl(tcin: string): string {
   return u.toString();
 }
 
-function stripWeightBrandSuffix(name: string | null): string | null {
-  if (!name) return null;
-  const clean = name.trim();
-
-  // Only strip when the dash segment contains size/weight/ct signals
-  // Example:
-  // "Cage-Free ... (CA SEFS Compliant) - 36oz/18ct - Good & Gather™" -> keep left side
-  const dashPattern =
-    /\s[-–—]\s[^-–—]*(\b\d+(?:\.\d+)?\s?(?:oz|fl\s?oz|floz|lb|lbs|g|kg|ml|l|ct|count|pack|pk|size)\b|\b\d+\s?ct\b|\/\d+\s?ct)\b[^-–—]*/i;
-
-  const match = clean.match(dashPattern);
-  if (!match || match.index == null) return clean;
-
-  const head = clean.slice(0, match.index).trim();
-  return head || clean;
-}
-
 function normalizeProductName(name: string | null): string | null {
-  if (!name) return null;
-  const decoded = decodeHtmlEntities(name);
-  const stripped = stripWeightBrandSuffix(decoded);
-  return stripBrandSuffix(stripped);
+  return cleanProductName(name, {
+    decodeHtml: true,
+    stripTrailingDashSize: true,
+    stripTrailingCount: true,
+    stripTrailingWeight: true,
+    stripBrandSuffixes: [
+      /Good\s*&\s*Gather(?:™|TM|®)?/i,
+      /Favorite\s*Day(?:™|TM|®)?/i,
+      /Market\s*Pantry(?:™|TM|®)?/i,
+    ],
+  });
 }
 
 function hasIngredientsOrNutrition(p: ScrapedProduct): boolean {
@@ -767,6 +795,7 @@ function hasIngredientsOrNutrition(p: ScrapedProduct): boolean {
 
 function logScrapedData(p: ScrapedProduct, url: string): void {
   const hasIng = !!p.ingredients?.trim();
+  const hasAllergens = !!p.allergenStatement?.trim();
   const hasNut =
     !!p.nutrition &&
     (!!p.nutrition.calories ||
@@ -775,6 +804,7 @@ function logScrapedData(p: ScrapedProduct, url: string): void {
 
   console.log(`  [DEBUG] name: ${p.name ?? "(null)"}`);
   console.log(`  [DEBUG] ingredients: ${hasIng ? `yes (${p.ingredients!.length} chars)` : "no"}`);
+  console.log(`  [DEBUG] allergens: ${hasAllergens ? `yes (${p.allergenStatement!.length} chars)` : "no"}`);
   console.log(`  [DEBUG] nutrition: ${hasNut ? "yes" : "no"}`);
   console.log(`  [DEBUG] upc12: ${p.upc12 ?? "(null)"}`);
   console.log(`  [DEBUG] url: ${url}`);
@@ -814,12 +844,32 @@ async function scrapeProductDetail(
 
     if (apiResult?.name && (apiResult.ingredients || apiResult.nutrition)) {
       if (DEBUG_PDP) console.log("[DEBUG] api-first: using redsky result, skipping DOM");
+      let allergenFromDom: string | null = null;
+      let brandFromDom: string | null = null;
+      if (!apiResult.allergenStatement || !brandOverride) {
+        try {
+          await page.goto(productUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+          await page.waitForTimeout(600);
+          await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
+          const html = await page.content();
+          const $ = cheerio.load(html);
+          allergenFromDom = parseAllergenStatementFromDom($);
+          brandFromDom = parseBrandFromDom($);
+          if (DEBUG_PDP) {
+            console.log(`[DEBUG] api-first: allergens from dom: ${allergenFromDom ? "yes" : "no"}`);
+            console.log(`[DEBUG] api-first: brand from dom: ${brandFromDom ?? "(null)"}`);
+          }
+        } catch {
+          // ignore
+        }
+      }
       const now = new Date().toISOString();
-      return {brand: brandOverride || extractBrandFromName(apiResult.name) || "Unknown",
+      return {brand: brandOverride || brandFromDom || "Unknown",
         source: SOURCE,
         productUrl,
         name: normalizeProductName(apiResult.name),
         ingredients: apiResult.ingredients ?? null,
+        allergenStatement: apiResult.allergenStatement ?? allergenFromDom ?? null,
         upc12: apiResult.upc12 ?? null,
         nutrition: apiResult.nutrition ?? null,
         imageUrl: addImageParams(apiResult.imageUrl ?? null),
@@ -848,7 +898,20 @@ async function scrapeProductDetail(
       }
     });
 
-    await page.goto(productUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    const gotoWithRetry = async (url: string): Promise<void> => {
+      try {
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      } catch (e: any) {
+        const msg = String(e?.message || e);
+        if (/ERR_TIMED_OUT|Timeout|Navigation timeout/i.test(msg)) {
+          await page.waitForTimeout(600);
+          await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+          return;
+        }
+        throw e;
+      }
+    };
+    await gotoWithRetry(productUrl);
     await page.waitForTimeout(800);
     await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
 
@@ -869,6 +932,7 @@ async function scrapeProductDetail(
       }
     }
     const $ = cheerio.load(html);
+    const brandFromDom = parseBrandFromDom($);
 
     const fromPreloaded = extractFromPreloadedQueries(html);
     const fromNext = extractFromNextData(html);
@@ -936,6 +1000,11 @@ async function scrapeProductDetail(
 
     const ingredients =
       fromPreloaded.ingredients ?? fromRedsky.ingredients ?? fromNext.ingredients ?? parseIngredientsFromDom($);
+    const allergenStatement =
+      fromPreloaded.allergenStatement ??
+      fromRedsky.allergenStatement ??
+      fromNext.allergenStatement ??
+      parseAllergenStatementFromDom($);
 
     const imageUrl =
       fromPreloaded.imageUrl ??
@@ -963,11 +1032,12 @@ async function scrapeProductDetail(
 
     const now = new Date().toISOString();
 
-    return {brand: brandOverride || extractBrandFromName(name) || "Unknown",
+    return {brand: brandOverride || brandFromDom || "Unknown",
       source: SOURCE,
       productUrl,
       name,
       ingredients: ingredients ?? null,
+      allergenStatement: allergenStatement ?? null,
       upc12,
       nutrition,
       imageUrl: imageUrlWithParams,
@@ -979,34 +1049,56 @@ async function scrapeProductDetail(
   }
 }
 
-async function expandListingPage(page: Page): Promise<void> {
-  const maxScrolls = 30;
-  let lastHeight = 0;
-  let stableCount = 0;
+async function expandListingPage(page: Page, listingUrl: string): Promise<string[]> {
+  const collected = new Set<string>();
+  const collectFromCurrentDom = async () => {
+    const urls = await extractProductDetailUrlsFromPage(page, listingUrl);
+    for (const url of urls) collected.add(url);
+  };
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => null);
+  await page.waitForTimeout(350);
+  await collectFromCurrentDom();
 
-  for (let i = 0; i < maxScrolls; i++) {
-    const productCount = await page.locator('a[href*="/p/"][href*="/-/A-"]').count().catch(() => 0);
+  // Slow incremental scroll is needed for Target lazy rendering/virtualization.
+  const maxPasses = 1;
+  let stablePasses = 0;
+  for (let pass = 0; pass < maxPasses; pass++) {
+    const beforePass = collected.size;
+    const metrics = await page.evaluate(() => ({
+      viewport: window.innerHeight || 900,
+      height: document.body.scrollHeight,
+    }));
+    const step = Math.max(480, Math.floor(metrics.viewport * 0.9));
+    const maxSteps = 40;
+    let y = 0;
 
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    for (let s = 0; s < maxSteps; s++) {
+      await page.evaluate((top) => window.scrollTo(0, top), y).catch(() => null);
+      await page.waitForTimeout(180);
+      await collectFromCurrentDom();
+      if (y >= metrics.height - metrics.viewport - 8) break;
+      y += step;
+    }
+
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => null);
     await page.waitForTimeout(500);
 
     const loadMore = page.getByRole("button", { name: /load more|show more|view more/i }).first();
-    if (await loadMore.isVisible({ timeout: 1000 }).catch(() => false)) {
+    if (await loadMore.isVisible({ timeout: 1200 }).catch(() => false)) {
       await loadMore.click({ timeout: 3000 }).catch(() => null);
-      await page.waitForTimeout(400);
+      await page.waitForTimeout(550);
     }
+    await collectFromCurrentDom();
 
-    const newHeight = await page.evaluate(() => document.body.scrollHeight);
-    const newCount = await page.locator('a[href*="/p/"][href*="/-/A-"]').count().catch(() => 0);
-
-    if (newHeight === lastHeight && newCount === productCount) {
-      stableCount++;
-      if (stableCount >= 2) break;
+    if (collected.size === beforePass) {
+      stablePasses++;
+      if (stablePasses >= 2) break;
     } else {
-      stableCount = 0;
+      stablePasses = 0;
     }
-    lastHeight = newHeight;
   }
+
+  return Array.from(collected);
 }
 
 function buildListingUrlWithNao(listingUrl: string, nao: number): string {
@@ -1022,71 +1114,215 @@ async function paginateListingPages(
   limit?: number
 ): Promise<string[]> {
   const out = new Set<string>();
-  const pageSize = 24;
-  const maxPages = 120;
+  let nao = 0;
+  let pageSize = 24;
+  const maxPages = 400;
+  let stagnantPages = 0;
+  let expectedTotal: number | null = null;
+  const MAX_STAGNANT_PAGES = 2;
 
   for (let pageIndex = 0; pageIndex < maxPages; pageIndex++) {
     if (limit != null && out.size >= limit) break;
-    const nao = pageIndex * pageSize;
     const pageUrl = buildListingUrlWithNao(listingUrl, nao);
-    if (DEBUG_PDP) console.log(`[DEBUG] listing page: ${pageUrl}`);
+    console.log(`[DISCOVER] Listing Page: ${pageUrl}`);
 
     await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => {});
     await page.waitForTimeout(1200);
-    await page.waitForSelector('a[href*="/p/"][href*="/-/A-"]', { timeout: 8000 }).catch(() => {});
+    await page.waitForSelector('a[href*="/p/"][href*="/-/A-"]', { timeout: 7000 }).catch(() => {});
+    const expandedUrls = await expandListingPage(page, listingUrl);
 
-    const html = await page.content();
-    const urls = extractProductDetailUrls(listingUrl, html);
+    const collectUrlsWithRetry = async (): Promise<{ pageText: string; urls: string[] }> => {
+      let domUrls = await extractProductDetailUrlsFromPage(page, listingUrl);
+      let urls = Array.from(new Set<string>([...expandedUrls, ...domUrls]));
+      let pageText = normalizeWhitespace(await page.locator("body").innerText().catch(() => ""));
+      if (urls.length > 0) return { pageText, urls };
+
+      // Pages occasionally render late; scroll + short retry before treating as empty.
+      for (let i = 0; i < 2; i++) {
+        await page.mouse.wheel(0, 2500).catch(() => null);
+        await page.waitForTimeout(450);
+      }
+      const expandedRetryUrls = await expandListingPage(page, listingUrl);
+      await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(700);
+      domUrls = await extractProductDetailUrlsFromPage(page, listingUrl);
+      urls = Array.from(new Set<string>([...expandedRetryUrls, ...domUrls]));
+      pageText = normalizeWhitespace(await page.locator("body").innerText().catch(() => ""));
+      if (urls.length > 0) return { pageText, urls };
+
+      // Some pages intermittently render empty; re-open the same Nao page once.
+      await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => {});
+      await page.waitForTimeout(1200);
+      const expandedReloadUrls = await expandListingPage(page, listingUrl);
+      domUrls = await extractProductDetailUrlsFromPage(page, listingUrl);
+      urls = Array.from(new Set<string>([...expandedReloadUrls, ...domUrls]));
+      pageText = normalizeWhitespace(await page.locator("body").innerText().catch(() => ""));
+      return { pageText, urls };
+    };
+
+    const { pageText, urls } = await collectUrlsWithRetry();
     const before = out.size;
     for (const u of urls) out.add(u);
-    if (DEBUG_PDP) console.log(`[DEBUG] pageIndex ${pageIndex} found ${urls.length}, total ${out.size}`);
+    console.log(`[DISCOVER] Page ${pageIndex + 1}: found ${urls.length} product URLs (running total: ${out.size})`);
 
-    if (urls.length === 0 || out.size === before) break;
+    if (expectedTotal == null) {
+      const resultsMatch = pageText.match(/\b(\d{1,3}(?:,\d{3})*)\s+results\b/i);
+      if (resultsMatch) {
+        const total = parseInt(resultsMatch[1].replace(/,/g, ""), 10);
+        if (!Number.isNaN(total) && total > 0) expectedTotal = total;
+      }
+    }
+    const rangeMatch = pageText.match(/\b(\d{1,3}(?:,\d{3})*)\s*-\s*(\d{1,3}(?:,\d{3})*)\s+of\s+(\d{1,3}(?:,\d{3})*)\b/i);
+    if (rangeMatch) {
+      const start = parseInt(rangeMatch[1].replace(/,/g, ""), 10);
+      const end = parseInt(rangeMatch[2].replace(/,/g, ""), 10);
+      const total = parseInt(rangeMatch[3].replace(/,/g, ""), 10);
+      const candidateSize = !Number.isNaN(start) && !Number.isNaN(end) ? end - start + 1 : NaN;
+      // Only trust page size when the range start lines up with requested Nao.
+      if (!Number.isNaN(candidateSize) && candidateSize > 0 && start === nao + 1) {
+        pageSize = Math.min(96, Math.max(1, candidateSize));
+      }
+      if (!Number.isNaN(total) && total > 0) expectedTotal = total;
+      if (!Number.isNaN(total) && end >= total) break;
+    }
+
+    if (urls.length === 0 || out.size === before) {
+      stagnantPages++;
+      if (stagnantPages >= MAX_STAGNANT_PAGES) break;
+    } else {
+      stagnantPages = 0;
+    }
+
+    if (expectedTotal != null && out.size >= expectedTotal) break;
+
+    // Conservative advance prevents skipping product windows when range parsing is noisy.
+    nao += Math.min(pageSize, 24);
   }
 
   const all = Array.from(out);
+  if (DEBUG_PDP && expectedTotal != null && all.length < expectedTotal) {
+    console.log(`[DEBUG] listing shortfall: extracted=${all.length}, expected≈${expectedTotal}`);
+  }
   return limit != null ? all.slice(0, limit) : all;
 }
 
-function extractProductDetailUrls(listingUrl: string, html: string): string[] {
-  const $ = cheerio.load(html);
-  const base = new URL(listingUrl);
+function normalizeTargetPdpUrl(listingUrl: string, rawHref: string): string | null {
+  try {
+    const base = new URL(listingUrl);
+    const abs = new URL(rawHref, base).toString();
+    const u = new URL(abs);
+    if (u.hostname !== "www.target.com" && u.hostname !== "target.com") return null;
+    const match = u.pathname.match(/\/p\/(?:[^/]+\/)?-\/A-(\d{8,})/);
+    if (!match) return null;
+    u.search = "";
+    u.hash = "";
+    return u.toString();
+  } catch {
+    return null;
+  }
+}
+
+async function extractProductDetailUrlsFromPage(page: Page, listingUrl: string): Promise<string[]> {
+  const hrefs = await page
+    .locator("a[href*='/p/'][href*='/-/A-']")
+    .evaluateAll((els) =>
+      Array.from(
+        new Set(
+          els
+            .map((el) => (el as HTMLAnchorElement).getAttribute("href") || "")
+            .filter((href) => !!href)
+        )
+      )
+    )
+    .catch(() => [] as string[]);
+
   const out = new Set<string>();
-
-  $('a[href*="/p/"][href*="/-/A-"]').each((_, el) => {
-    const href = $(el).attr("href");
-    if (!href) return;
-
-    try {
-      const abs = new URL(href, base).toString();
-      const u = new URL(abs);
-
-      if (u.hostname !== "www.target.com" && u.hostname !== "target.com") return;
-
-      const match = u.pathname.match(/\/p\/([^/]+)\/-\/A-(\d{8,})/);
-      if (!match) return;
-
-      u.search = "";
-      u.hash = "";
-      out.add(u.toString());
-    } catch {
-      // skip invalid URLs
-    }
-  });
-
+  for (const href of hrefs) {
+    const normalized = normalizeTargetPdpUrl(listingUrl, href);
+    if (normalized) out.add(normalized);
+  }
   return Array.from(out);
 }
 
 async function scrapeListing(
-  browserContext: BrowserContext,
+  browser: Browser,
   brandCfg: BrandConfig,
   limit?: number
 ): Promise<string[]> {
-  const page = await browserContext.newPage();
+  const listingContext = await browser.newContext(TARGET_CONTEXT_OPTIONS);
+  const page = await listingContext.newPage();
   try {
     await page.goto(brandCfg.listingUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await page.waitForTimeout(1200);
     return await paginateListingPages(page, brandCfg.listingUrl, limit);
+  } finally {
+    await page.close().catch(() => null);
+    await listingContext.close().catch(() => null);
+  }
+}
+
+function normalizeTargetCategoryUrl(urlOrPath: string): string | null {
+  if (!urlOrPath) return null;
+  try {
+    const u = new URL(urlOrPath, "https://www.target.com");
+    if (u.hostname !== "www.target.com" && u.hostname !== "target.com") return null;
+    return u.toString();
+  } catch {
+    return null;
+  }
+}
+
+function normalizeTargetListingUrl(urlOrPath: string): string | null {
+  if (!urlOrPath) return null;
+  try {
+    const u = new URL(urlOrPath, "https://www.target.com");
+    if (u.hostname !== "www.target.com" && u.hostname !== "target.com") return null;
+    if (!u.pathname.startsWith("/c/")) return null;
+    u.search = "";
+    u.hash = "";
+    return u.toString();
+  } catch {
+    return null;
+  }
+}
+
+async function discoverSubcategoryListingUrls(
+  browserContext: BrowserContext,
+  categoryUrl: string
+): Promise<string[]> {
+  const page = await browserContext.newPage();
+  try {
+    await page.goto(categoryUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+
+    // Expand all bubcat items when a "Show all N" button exists.
+    for (let i = 0; i < 3; i++) {
+      const showAllBtn = page
+        .locator("button[data-test='loadMoreRecommendations'][aria-label*='Show all']")
+        .first();
+      const visible = await showAllBtn.isVisible({ timeout: 1000 }).catch(() => false);
+      if (!visible) break;
+      await showAllBtn.click({ timeout: 3000 }).catch(() => null);
+      await page.waitForTimeout(800);
+    }
+
+    const hrefs = await page
+      .locator("[data-test='@web/slingshot-components/bubcat'] a[href^='/c/']")
+      .evaluateAll((els) =>
+        Array.from(new Set(els.map((el) => (el as HTMLAnchorElement).getAttribute("href") || "").filter(Boolean)))
+      )
+      .catch(() => [] as string[]);
+
+    const listingUrls = new Set<string>();
+    for (const href of hrefs) {
+      const normalized = normalizeTargetCategoryUrl(href);
+      if (normalized) listingUrls.add(normalized);
+    }
+
+    return Array.from(listingUrls);
   } finally {
     await page.close().catch(() => null);
   }
@@ -1102,6 +1338,7 @@ function transformToOutput(p: ScrapedProduct): ScraperProductOutput {
     brand: p.brand,
     upc: p.upc12 || undefined,
     ingredients_text: p.ingredients || "",
+    allergen_statement: p.allergenStatement || undefined,
     serving_size_value: serving.value ?? undefined,
     serving_size_unit: serving.unit ?? undefined,
     serving_size_text: p.nutrition?.servingSize ?? undefined,
@@ -1115,28 +1352,113 @@ function transformToOutput(p: ScrapedProduct): ScraperProductOutput {
 
 async function getServiceToken(): Promise<string> {
   if (serviceTokenCache) return serviceTokenCache;
-  const cmd = new GetParameterCommand({ Name: API_KEYS_PARAMETER_NAME, WithDecryption: true });
-  const res = await ssmClient.send(cmd);
-  const param = JSON.parse(res.Parameter?.Value || "{}");
+  const param = await getApiKeysParam();
   serviceTokenCache = param.InternalServiceToken;
   if (!serviceTokenCache) throw new Error("InternalServiceToken not found");
   return serviceTokenCache;
 }
 
-async function submitProduct(p: ScrapedProduct): Promise<boolean> {
-  if (!p.name || !hasIngredientsOrNutrition(p)) {
-    console.log(`Skipping ${p.productUrl}: missing name, ingredients, and nutrition (likely raw produce)`);
+async function getApiKeysParam(): Promise<Record<string, any>> {
+  if (apiKeysCache) return apiKeysCache;
+  const cmd = new GetParameterCommand({ Name: API_KEYS_PARAMETER_NAME, WithDecryption: true });
+  const res = await ssmClient.send(cmd);
+  const param = JSON.parse(res.Parameter?.Value || "{}");
+  apiKeysCache = param;
+  return param;
+}
+
+async function checkProductExists(params: {
+  name: string | null;
+  brand: string | null;
+  upc: string | null;
+}): Promise<boolean> {
+  const { name, brand, upc } = params;
+  if (!name || typeof generateDeterministicProductId !== "function") return false;
+  const productId = generateDeterministicProductId(name, brand || undefined, upc || undefined);
+  try {
+    const token = await getServiceToken();
+    const res = await fetch(`${PRODUCTS_API_URL}/${productId}`, {
+      method: "GET",
+      headers: { "X-Service-Token": token },
+    });
+    return res.ok;
+  } catch (e) {
+    if (DEBUG_PDP) console.log("[DEBUG] product exists check failed:", e);
     return false;
   }
-  if (!p.upc12) {
-    console.log(`Skipping ${p.productUrl}: missing UPC`);
+}
+
+function normalizeUpc(upc: string | null | undefined): string | null {
+  if (!upc) return null;
+  const digits = upc.replace(/\D/g, "");
+  if (!digits) return null;
+  if (digits.length === 12) return digits;
+  if (digits.length === 13 && digits.startsWith("0")) return digits.slice(1);
+  if (digits.length === 14 && digits.startsWith("00")) return digits.slice(2);
+  return digits;
+}
+
+async function loadExistingUpcs(): Promise<Set<string>> {
+  if (existingUpcSetPromise) return existingUpcSetPromise;
+  existingUpcSetPromise = (async () => {
+    const set = new Set<string>();
+    const { Client: PgClient } = await import("pg");
+    const param = await getApiKeysParam();
+    const conn = param.SupabaseDbUrl || process.env.SCRAPER_FAILURES_DB_URL || process.env.DATABASE_URL;
+    if (!conn) throw new Error("SupabaseDbUrl not found");
+
+    const client = new PgClient({ connectionString: conn });
+    client.on("error", (err: any) => {
+      if (DEBUG_PDP) console.log("[DEBUG] UPC DB client error:", err?.message || err);
+    });
+
+    try {
+      await client.connect();
+      const res = await client.query(`
+        SELECT TRIM(upc) as upc
+        FROM product_upcs
+        WHERE upc IS NOT NULL
+        UNION
+        SELECT TRIM(upc) as upc
+        FROM products
+        WHERE upc IS NOT NULL
+      `);
+      for (const row of res.rows) {
+        const upc = normalizeUpc((row as any)?.upc || null);
+        if (upc) set.add(upc);
+      }
+    } finally {
+      await client.end().catch(() => null);
+    }
+    if (DEBUG_PDP) console.log(`[DEBUG] loaded ${set.size} existing UPCs from SQL`);
+    return set;
+  })().catch((err) => {
+    existingUpcSetPromise = null;
+    throw err;
+  });
+  return existingUpcSetPromise;
+}
+
+async function checkProductExistsByUpc(upc: string | null): Promise<boolean> {
+  const normalized = normalizeUpc(upc);
+  if (!normalized) return false;
+  const upcSet = await loadExistingUpcs();
+  return upcSet.has(normalized);
+}
+
+async function submitProduct(p: ScrapedProduct): Promise<boolean> {
+  const body = transformToOutput(p);
+  if (!body.product_name || (!body.ingredients_text && !body.nutrition)) {
+    console.log(`Skipping ${body.source_id}: missing name, ingredients, and nutrition (likely raw produce)`);
+    return false;
+  }
+  if (!body.upc) {
+    console.log(`Skipping ${body.source_id}: missing UPC`);
     return false;
   }
   try {
     const token = await getServiceToken();
-    const body = transformToOutput(p);
     const { scraper_job_id: _, ...req } = body as any;
-
     const res = await fetch(`${API_BASE_URL}/submit-product-for-review`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Service-Token": token },
@@ -1144,7 +1466,7 @@ async function submitProduct(p: ScrapedProduct): Promise<boolean> {
     });
 
     if (res.ok) {
-      console.log(`✅ Submitted "${p.name}"`);
+      console.log(`✅ Submitted "${body.product_name}"`);
       return true;
     }
     console.error(`❌ Submit failed: HTTP ${res.status}`);
@@ -1155,18 +1477,62 @@ async function submitProduct(p: ScrapedProduct): Promise<boolean> {
   }
 }
 
-async function uploadToS3(results: ScraperProductOutput[], runDateTime: string): Promise<void> {
+async function uploadToS3(filePath: string, runDateTime: string): Promise<void> {
   if (!SCRAPER_OUTPUTS_BUCKET) return;
   const key = `${SCRAPER_NAME}/${runDateTime}/products.json`;
   await s3Client.send(
     new PutObjectCommand({
       Bucket: SCRAPER_OUTPUTS_BUCKET,
       Key: key,
-      Body: JSON.stringify(results, null, 2),
+      Body: fs.createReadStream(filePath),
       ContentType: "application/json",
     })
   );
   console.log(`Uploaded to s3://${SCRAPER_OUTPUTS_BUCKET}/${key}`);
+}
+
+function createJsonArrayWriter(filePath: string) {
+  const stream = fs.createWriteStream(filePath, { encoding: "utf8" });
+  let writeChain: Promise<void> = Promise.resolve();
+  let firstItem = true;
+  let finalized = false;
+
+  const writeChunk = (chunk: string): Promise<void> =>
+    new Promise((resolve, reject) => {
+      const onError = (err: Error) => reject(err);
+      stream.once("error", onError);
+      const done = () => {
+        stream.removeListener("error", onError);
+        resolve();
+      };
+      if (!stream.write(chunk, "utf8")) {
+        stream.once("drain", done);
+      } else {
+        done();
+      }
+    });
+
+  writeChain = writeChain.then(() => writeChunk("[\n"));
+
+  return {
+    append: (record: ScraperProductOutput): Promise<void> => {
+      if (finalized) return Promise.reject(new Error("Cannot append after finalize"));
+      const prefix = firstItem ? "" : ",\n";
+      firstItem = false;
+      writeChain = writeChain.then(() => writeChunk(prefix + JSON.stringify(record)));
+      return writeChain;
+    },
+    finalize: async (): Promise<void> => {
+      if (finalized) return;
+      finalized = true;
+      writeChain = writeChain.then(() => writeChunk("\n]\n"));
+      await writeChain;
+      await new Promise<void>((resolve, reject) => {
+        stream.once("error", reject);
+        stream.end(() => resolve());
+      });
+    },
+  };
 }
 
 async function updateJobStatus(jobId: string, status: string, error: string | null = null): Promise<void> {
@@ -1192,8 +1558,11 @@ function parseArgs() {
   let url: string | undefined;
   let configPath: string | undefined;
   let limit: number | undefined;
+  let offset = 0;
   let local = false;
   let debug = false;
+  let noHeadless = false;
+  let headless = false;
 
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--url" || argv[i] === "-u") {
@@ -1206,18 +1575,26 @@ function parseArgs() {
       limit = parseInt(argv[i + 1], 10);
       if (isNaN(limit) || limit < 1) limit = undefined;
       i++;
+    } else if (argv[i] === "--offset" || argv[i] === "-o") {
+      offset = parseInt(argv[i + 1], 10);
+      if (isNaN(offset) || offset < 0) offset = 0;
+      i++;
     } else if (argv[i] === "--local") {
       local = true;
     } else if ((argv[i] === "--debug" || argv[i] === "-d")) {
       debug = true;
+    } else if (argv[i] === "--no-headless") {
+      noHeadless = true;
+    } else if (argv[i] === "--headless") {
+      headless = true;
     }
   }
 
-  return { url, configPath, limit, local, debug };
+  return { url, configPath, limit, offset, local, debug, noHeadless, headless };
 }
 
 async function main(): Promise<void> {
-  const { url, configPath, limit, local, debug } = parseArgs();
+  const { url, configPath, limit, offset, local, debug, noHeadless, headless } = parseArgs();
 
   DEBUG_PDP = debug;
 
@@ -1236,10 +1613,9 @@ async function main(): Promise<void> {
     }
   } else {
     console.error("Usage: npx tsx scrape.ts --url <TARGET_PRODUCT_URL>");
-    console.error("   or: npx tsx scrape.ts --config ./config.json [--limit N] [--local]");
+    console.error("   or: npx tsx scrape.ts --config ./config.json [--limit N] [--offset N] [--local]");
     process.exit(1);
   }
-
   const jobId = uuidv4();
   const runDateTime = new Date().toISOString().replace(/[:.]/g, "-").slice(0, -5);
 
@@ -1258,8 +1634,12 @@ async function main(): Promise<void> {
     );
   }
 
+  let runHeadless = true;
+  if (noHeadless) runHeadless = false;
+  if (headless) runHeadless = true;
+
   const browser: Browser = await chromium.launch({
-    headless: true,
+    headless: runHeadless,
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
@@ -1269,30 +1649,238 @@ async function main(): Promise<void> {
     ],
   });
 
-  const context: BrowserContext = await browser.newContext({
-    userAgent:
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    locale: "en-US",
-    viewport: { width: 1280, height: 720 },
-  });
+  const context: BrowserContext = await browser.newContext(TARGET_CONTEXT_OPTIONS);
+
+  const outputFilePath = `/tmp/${SCRAPER_NAME}-${runDateTime}-${jobId}-products.json`;
+  const outputWriter = createJsonArrayWriter(outputFilePath);
+  let outputWriterFinalized = false;
+  let outputCount = 0;
+  let skipped = 0;
+  let submitted = 0;
+  let submitFailed = 0;
+  const submitBatch: ScrapedProduct[] = [];
+  const SUBMIT_BATCH_SIZE = 10;
+  const MAX_PENDING_SUBMITS = 30;
+  let plannedTotalTargets = 0;
+  let seenDiscoveredTargets = 0;
+  let selectedDiscoveredTargets = 0;
+
+  const flushSubmitBatch = async (force: boolean) => {
+    if (!force && submitBatch.length < SUBMIT_BATCH_SIZE) return;
+    if (submitBatch.length === 0) return;
+    const take = force ? submitBatch.length : Math.min(SUBMIT_BATCH_SIZE, submitBatch.length);
+    const batch = submitBatch.splice(0, take);
+    console.log(`\n➡️  Submitting batch (${batch.length} items)`);
+    for (const p of batch) {
+      const ok = await submitProduct(p);
+      if (ok) submitted++;
+      else submitFailed++;
+    }
+    batch.length = 0;
+    if (typeof (globalThis as any).gc === "function") {
+      (globalThis as any).gc();
+    }
+  };
+
+  let flushChain: Promise<void> = Promise.resolve();
+  const queueFlush = (force: boolean) => {
+    flushChain = flushChain.then(() => flushSubmitBatch(force)).catch((err) => {
+      console.error("[SUBMIT] batch flush failed:", err);
+    });
+    return flushChain;
+  };
+
+  const runScrapeQueue = async (batchTargets: UrlWithBrand[]) => {
+    if (batchTargets.length === 0) return;
+    plannedTotalTargets += batchTargets.length;
+
+    const queue = [...batchTargets];
+    const workerCount = Math.min(5, queue.length);
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (queue.length) {
+        const next = queue.shift();
+        if (!next) break;
+        const u = next.url;
+        const brand = next.brand;
+        console.log(`[SCRAPE] Product URL: ${u}`);
+        let p: ScrapedProduct | null = null;
+        try {
+          p = await scrapeProductDetail(context, u, brand);
+        } catch (e: any) {
+          const msg = String(e?.message || e);
+          if (e?.name === "TimeoutError" || /ERR_TIMED_OUT|Navigation timeout|ERR_ABORTED|ERR_CONNECTION_RESET/i.test(msg)) {
+            skipped++;
+            console.log(`[SKIP] ${u}: navigation failed (${msg.includes("ERR_") ? msg.match(/ERR_[A-Z_]+/)?.[0] ?? "timeout" : "timeout"})`);
+            continue;
+          }
+          skipped++;
+          console.log(`[SKIP] ${u}: unexpected scrape error`);
+          if (DEBUG_PDP) console.error(e);
+          continue;
+        }
+
+        if (!hasIngredientsOrNutrition(p)) {
+          skipped++;
+          console.log(`[SKIP] ${p.name ?? "(no name)"}: no ingredients and no nutrition`);
+          logScrapedData(p, u);
+          continue;
+        }
+        if (!p.upc12) {
+          skipped++;
+          console.log(`[SKIP] ${p.name ?? "(no name)"}: missing UPC`);
+          logScrapedData(p, u);
+          continue;
+        }
+
+        const transformed = transformToOutput(p);
+        const existsById = await checkProductExists({
+          name: transformed.product_name || null,
+          brand: transformed.brand || null,
+          upc: transformed.upc || transformed.upcs?.[0] || null,
+        });
+        let existsByUpc = false;
+        try {
+          existsByUpc = await checkProductExistsByUpc(transformed.upc || transformed.upcs?.[0] || null);
+        } catch (upcErr) {
+          skipped++;
+          console.log(
+            `[SKIP] ${transformed.product_name || "(no name)"}: UPC verification failed`
+          );
+          if (DEBUG_PDP) console.log("[DEBUG] upc exists check failed:", upcErr);
+          continue;
+        }
+        if (existsById || existsByUpc) {
+          skipped++;
+          console.log(
+            `[SKIP] ${transformed.product_name || "(no name)"}: already exists` +
+              (existsByUpc && !existsById ? " (matched by UPC)" : "")
+          );
+          continue;
+        }
+        outputCount++;
+        await outputWriter.append(transformed);
+        if (outputCount % 10 === 0) {
+          console.log(`[PROGRESS] scraped ${outputCount} products`);
+        }
+        console.log(`[OK] ${p.name ?? "(no name)"} | ${u}`);
+        submitBatch.push(p);
+        if (submitBatch.length >= SUBMIT_BATCH_SIZE) {
+          void queueFlush(false);
+        }
+        if (submitBatch.length >= MAX_PENDING_SUBMITS) {
+          await queueFlush(false);
+        }
+      }
+    });
+
+    await Promise.all(workers);
+  };
+
+  const takeDiscovered = (items: UrlWithBrand[]): UrlWithBrand[] => {
+    const selected: UrlWithBrand[] = [];
+    for (const item of items) {
+      if (seenDiscoveredTargets < offset) {
+        seenDiscoveredTargets++;
+        continue;
+      }
+      if (limit != null && selectedDiscoveredTargets >= limit) break;
+      selected.push(item);
+      seenDiscoveredTargets++;
+      selectedDiscoveredTargets++;
+    }
+    return selected;
+  };
+
+  const reachedLimit = () => limit != null && selectedDiscoveredTargets >= limit;
+  let incrementalDiscoveryMode = false;
+  const processedListingUrls = new Set<string>();
 
   try {
     if (configPath) {
       const cfg = JSON.parse(fs.readFileSync(configPath, "utf8")) as AppConfig;
-      if (Array.isArray(cfg.brands) && cfg.brands.length > 0) {
-        const discovered: UrlWithBrand[] = [];
-        for (const brandCfg of cfg.brands) {
-          if (!brandCfg.listingUrl?.startsWith("https://www.target.com/")) continue;
-          console.log(`\n[DISCOVER] ${brandCfg.brand}: ${brandCfg.listingUrl}`);
-          const urls = await scrapeListing(context, brandCfg, limit);
-          console.log(`[DISCOVER] ${brandCfg.brand}: ${urls.length} product URLs`);
+      const skipListingUrls = new Set<string>(
+        (cfg.skipListingUrls || [])
+          .map((u) => normalizeTargetListingUrl(u))
+          .filter((u): u is string => !!u)
+      );
+      if (
+        (Array.isArray(cfg.brands) && cfg.brands.length > 0) ||
+        (Array.isArray(cfg.categoryUrls) && cfg.categoryUrls.length > 0)
+      ) {
+        incrementalDiscoveryMode = true;
 
-          const brand =
-            brandCfg.listingUrl?.toLowerCase().includes("good-gather") ? "Good & Gather" : brandCfg.brand;
+        if (Array.isArray(cfg.categoryUrls) && cfg.categoryUrls.length > 0) {
+          for (const categorySeed of cfg.categoryUrls) {
+            if (reachedLimit()) break;
+            const normalizedCategory = normalizeTargetCategoryUrl(categorySeed);
+            if (!normalizedCategory) continue;
 
-          for (const u of urls) discovered.push({ url: u, brand });
+            console.log(`\n[DISCOVER] Category Seed: ${normalizedCategory}`);
+            const listingUrls = await discoverSubcategoryListingUrls(context, normalizedCategory);
+            console.log(`[DISCOVER] Category Seed: ${listingUrls.length} listing URLs`);
+
+            for (const listingUrl of listingUrls) {
+              if (reachedLimit()) break;
+              const normalizedListing = normalizeTargetListingUrl(listingUrl) || listingUrl;
+              if (skipListingUrls.has(normalizedListing)) {
+                console.log(`[DISCOVER] Listing ${listingUrl}: skipped (config skipListingUrls)`);
+                continue;
+              }
+              if (processedListingUrls.has(listingUrl)) {
+                console.log(`[DISCOVER] Listing ${listingUrl}: skipped (already processed)`);
+                continue;
+              }
+              processedListingUrls.add(listingUrl);
+              const remaining = limit != null ? Math.max(limit - selectedDiscoveredTargets, 0) : undefined;
+              const urls = await scrapeListing(browser, { brand: "", listingUrl }, remaining);
+              console.log(`[DISCOVER] Listing ${listingUrl}: ${urls.length} product URLs`);
+              const listingTargets = takeDiscovered(urls.map((u) => ({ url: u })));
+              if (listingTargets.length > 0) {
+                console.log(`[SCRAPE] Listing ${listingUrl}: ${listingTargets.length} product URLs`);
+                await runScrapeQueue(listingTargets);
+                await queueFlush(true);
+                await flushChain;
+                if (typeof (globalThis as any).gc === "function") {
+                  (globalThis as any).gc();
+                }
+              }
+            }
+          }
         }
-        targets = discovered.length > 0 ? discovered : targets;
+
+        if (Array.isArray(cfg.brands) && cfg.brands.length > 0 && !reachedLimit()) {
+          for (const brandCfg of cfg.brands) {
+            if (reachedLimit()) break;
+            if (!brandCfg.listingUrl?.startsWith("https://www.target.com/")) continue;
+            const normalizedBrandListing = normalizeTargetListingUrl(brandCfg.listingUrl) || brandCfg.listingUrl;
+            if (skipListingUrls.has(normalizedBrandListing)) {
+              console.log(`\n[DISCOVER] ${brandCfg.brand}: ${brandCfg.listingUrl} (skipped, config skipListingUrls)`);
+              continue;
+            }
+            if (processedListingUrls.has(brandCfg.listingUrl)) {
+              console.log(`\n[DISCOVER] ${brandCfg.brand}: ${brandCfg.listingUrl} (skipped, already processed)`);
+              continue;
+            }
+            processedListingUrls.add(brandCfg.listingUrl);
+            const remaining = limit != null ? Math.max(limit - selectedDiscoveredTargets, 0) : undefined;
+            console.log(`\n[DISCOVER] ${brandCfg.brand}: ${brandCfg.listingUrl}`);
+            const urls = await scrapeListing(browser, brandCfg, remaining);
+            console.log(`[DISCOVER] ${brandCfg.brand}: ${urls.length} product URLs`);
+
+            const brand =
+              brandCfg.listingUrl?.toLowerCase().includes("good-gather") ? "Good & Gather" : brandCfg.brand;
+            const brandTargets = takeDiscovered(urls.map((u) => ({ url: u, brand })));
+            if (brandTargets.length > 0) {
+              console.log(`[SCRAPE] ${brandCfg.brand}: ${brandTargets.length} product URLs`);
+              await runScrapeQueue(brandTargets);
+              await queueFlush(true);
+              await flushChain;
+              if (typeof (globalThis as any).gc === "function") {
+                (globalThis as any).gc();
+              }
+            }
+          }
+        }
       }
     }
   } catch (e) {
@@ -1303,76 +1891,57 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  if (limit != null) targets = targets.slice(0, limit);
+  if (!incrementalDiscoveryMode) {
+    if (offset > 0) targets = targets.slice(offset);
+    if (limit != null) targets = targets.slice(0, limit);
 
-  if (targets.length === 0) {
-    console.error("No valid Target product URLs to scrape.");
-    await context.close().catch(() => null);
-    await browser.close().catch(() => null);
-    process.exit(1);
+    if (targets.length === 0) {
+      console.error("No valid Target product URLs to scrape.");
+      await context.close().catch(() => null);
+      await browser.close().catch(() => null);
+      process.exit(1);
+    }
   }
 
-  const limiter = pLimit(5);
-  const outputs: ScraperProductOutput[] = [];
-  let skipped = 0;
-
   try {
-    const results = await Promise.all(
-      targets.map(({ url: u, brand }) =>
-        limiter(async () => {
-          try {
-            const p = await scrapeProductDetail(context, u, brand);
-            return { product: p, url: u, timedOut: false };
-          } catch (e: any) {
-            if (e?.name === "TimeoutError") {
-              return { product: null as any, url: u, timedOut: true };
-            }
-            throw e;
-          }
-        })
-      )
-    );
-
-    for (const { product: p, url: u, timedOut } of results) {
-      if (timedOut) {
-        skipped++;
-        console.log(`[SKIP] ${u}: timed out after 60s (likely non-product page)`);
-        continue;
-      }
-
-      if (!hasIngredientsOrNutrition(p)) {
-        skipped++;
-        console.log(`[SKIP] ${p.name ?? "(no name)"}: no ingredients and no nutrition`);
-        logScrapedData(p, u);
-        continue;
-      }
-      if (!p.upc12) {
-        skipped++;
-        console.log(`[SKIP] ${p.name ?? "(no name)"}: missing UPC`);
-        logScrapedData(p, u);
-        continue;
-      }
-
-      outputs.push(transformToOutput(p));
-      console.log(`[OK] ${p.name ?? "(no name)"} | ${u}`);
-
-      await submitProduct(p);
+    if (!incrementalDiscoveryMode) {
+      await runScrapeQueue(targets);
     }
+    await queueFlush(true);
+    await flushChain;
   } catch (e) {
     console.error(e);
     if (!local) await updateJobStatus(jobId, "failed", String(e));
   } finally {
+    try {
+      if (!outputWriterFinalized) {
+        await outputWriter.finalize();
+        outputWriterFinalized = true;
+      }
+    } catch (finalizeError) {
+      console.error("[OUTPUT] failed to finalize output file:", finalizeError);
+    }
     await context.close().catch(() => null);
     await browser.close().catch(() => null);
   }
 
-  console.log(
-    `\nScraped ${outputs.length} valid products (skipped ${skipped} without ingredients/nutrition) out of ${targets.length} total`
-  );
+  if (!outputWriterFinalized) {
+    await outputWriter.finalize();
+    outputWriterFinalized = true;
+  }
 
-  if (!local && outputs.length > 0) {
-    await uploadToS3(outputs, runDateTime);
+  console.log(`\nScraped ${outputCount} valid products (skipped ${skipped} without ingredients/nutrition) out of ${plannedTotalTargets} total`);
+  console.log(`📊 API: ${submitted} submitted, ${submitFailed} failed`);
+
+  if (!local && outputCount > 0) {
+    await uploadToS3(outputFilePath, runDateTime);
     await updateJobStatus(jobId, "completed");
+  }
+
+  try {
+    fs.unlinkSync(outputFilePath);
+  } catch {
+    // ignore cleanup failure
   }
 }
 

@@ -1,16 +1,14 @@
 {
-  "brands": [
-    {
-      "brand": "Favorite Day",
-      "listingUrl": "https://www.target.com/b/favorite-day/-/N-q643lewlzpu"
-    },
-    {
-      "brand": "Good & Gather",
-      "listingUrl": "https://www.target.com/b/good-gather/-/N-yfqzk"
-    },
-    {
-      "brand": "Market Pantry",
-      "listingUrl": "https://www.target.com/b/market-pantry/-/N-85ceg"
-    }
+  "skipListingUrls": [
+  ],
+   "categoryUrls": [
+    "https://www.target.com/c/bakery-bread-grocery/-/N-5xt19",
+    "https://www.target.com/c/beverages-grocery/-/N-5xt0r",
+    "https://www.target.com/c/pantry-grocery/-/N-5xt13",
+    "https://www.target.com/c/breakfast-cereal-grocery/-/N-wo2mp",
+    "https://www.target.com/c/dairy-grocery/-/N-5xszm",
+    "https://www.target.com/c/deli-grocery/-/N-5hp74",
+    "https://www.target.com/c/candy-grocery/-/N-5xt0d",
+    "https://www.target.com/c/coffee-beverages-grocery/-/N-4yi5p"    
   ]
 }

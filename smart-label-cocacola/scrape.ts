@@ -10,8 +10,19 @@ import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 import { v4 as uuidv4 } from "uuid";
 import { chromium, type Browser } from "playwright";
 import type { ScraperProductOutput, ScraperNutritionData } from "../shared-types";
+import * as nameUtils from "../name-utils";
+import * as servingSizeUtils from "../serving-size-utils";
+import * as productIdUtils from "../product-id-utils";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const cleanProductName =
+  (nameUtils as any).cleanProductName ?? (nameUtils as any).default?.cleanProductName;
+const parseServingSizeFromText =
+  (servingSizeUtils as any).parseServingSizeFromText ??
+  (servingSizeUtils as any).default?.parseServingSizeFromText;
+const generateDeterministicProductId =
+  (productIdUtils as any).generateDeterministicProductId ??
+  (productIdUtils as any).default?.generateDeterministicProductId;
 
 type UrlEntry =
   | string
@@ -30,6 +41,7 @@ type ScrapedProduct = {
   upc12: string | null;
   upcs?: string[];
   ingredientsText: string | null;
+  allergenStatement?: string | null;
   imageUrl: string | null;
   nutrition?: ScraperNutritionData | null;
   servingSizeText?: string | null;
@@ -40,10 +52,11 @@ type ScrapedProduct = {
 const SCRAPER_NAME = process.env.JOB_NAME || "smart-label-cocacola";
 const SCRAPER_OUTPUTS_BUCKET = process.env.SCRAPER_OUTPUTS_BUCKET;
 const SCRAPER_JOB_STATUS_TABLE_NAME = process.env.SCRAPER_JOB_STATUS_TABLE_NAME;
-const API_BASE_URL = process.env.API_BASE_URL || "https://it7rdy3qbh.execute-api.us-west-2.amazonaws.com";
+const API_BASE_URL = process.env.API_BASE_URL || "https://api.mytummi.app";
+const PRODUCTS_API_URL = `${API_BASE_URL}/products`;
 const API_KEYS_PARAMETER_NAME = process.env.API_KEYS_PARAMETER_NAME || "/tummi/api-keys";
 let DEBUG_SMART_LABEL = false;
-const SMART_LABEL_HEADLESS = process.env.SMART_LABEL_HEADLESS !== "0";
+let SMART_LABEL_HEADLESS = process.env.SMART_LABEL_HEADLESS !== "0";
 
 const s3Client = new S3Client({});
 const dynamoDbClient = new DynamoDBClient({});
@@ -74,7 +87,7 @@ function parseNutrientAmountWithQualifier(amount: string | null): ParsedNutrient
   if (!match) return null;
   const value = parseFloat(match[1]);
   if (Number.isNaN(value)) return null;
-  return {value, qualifier};
+  return { value, qualifier };
 }
 
 async function getServiceToken(): Promise<string> {
@@ -88,6 +101,28 @@ async function getServiceToken(): Promise<string> {
   serviceTokenCache = parameter.InternalServiceToken;
   if (!serviceTokenCache) throw new Error("InternalServiceToken not found");
   return serviceTokenCache;
+}
+
+async function checkProductExists(params: {
+  name: string | null;
+  brand: string | null;
+  upc: string | null;
+}): Promise<boolean> {
+  const { name, brand, upc } = params;
+  if (!name || typeof generateDeterministicProductId !== "function") return false;
+  const productId = generateDeterministicProductId(name, brand || undefined, upc || undefined);
+  try {
+    const token = await getServiceToken();
+    const res = await axios.get(`${PRODUCTS_API_URL}/${productId}`, {
+      headers: { "X-Service-Token": token },
+      timeout: 10_000,
+    });
+    return !!res?.data;
+  } catch (e: any) {
+    if (e?.response?.status === 404) return false;
+    if (DEBUG_SMART_LABEL) console.log("[DEBUG] product exists check failed:", e);
+    return false;
+  }
 }
 
 function normalizeWhitespace(text: string): string {
@@ -116,18 +151,17 @@ function extractUpc(text: string): string | null {
   return match?.[1] ?? null;
 }
 
-function parseServingSize(servingSizeText: string | null): { value: number | null; unit: string | null } {
-  if (!servingSizeText || typeof servingSizeText !== "string") return {value: null, unit: null};
-  const cleaned = servingSizeText.trim().replace(/\([^)]*\)/g, "").trim();
-  let match = cleaned.match(/^(\d+)\s*\/\s*(\d+)\s*([a-zA-Z]+)/);
-  if (match) {
-    const value = parseFloat(match[1]) / parseFloat(match[2]);
-    return {value, unit: match[3].toLowerCase()};
-  }
-  match = cleaned.match(/^(\d+(?:\.\d+)?)\s*([a-zA-Z]+)/);
-  if (match) return {value: parseFloat(match[1]), unit: match[2].toLowerCase()};
-  return {value: null, unit: null};
+function isAllowedCocaColaUrl(url: string): boolean {
+  return /^https?:\/\/(smartlabelpr\.)?smartlabel\.coca-colaproductfacts\.com\//i.test(url);
 }
+
+function parseServingSize(servingSizeText: string | null): { value: number | null; unit: string | null } {
+  if (typeof parseServingSizeFromText !== "function") {
+    throw new Error("parseServingSizeFromText import failed");
+  }
+  return parseServingSizeFromText(servingSizeText);
+}
+
 
 const NUTRIENT_COLUMN_MAP: Record<string, string> = {
   "total fat": "total_fat_g",
@@ -210,13 +244,189 @@ function mapNutrientToDvColumn(name: string): string | null {
   return null;
 }
 
+function parseCocaPrNutrition(
+  $: cheerio.CheerioAPI
+): { nutrition: ScraperNutritionData | null; servingSizeText: string | null } {
+  const section = $(".nutrition-category").first();
+  if (!section.length) return { nutrition: null, servingSizeText: null };
+
+  const nutrition: ScraperNutritionData = {
+    serving_size_value: 1,
+    serving_size_unit_text: "serving",
+    serving_size_text: null,
+  };
+
+  const servingSizeText = normalizeWhitespace(
+    section
+      .find(".serving-size, .serving-size-text, .serving-size-value, .serving-size-label")
+      .first()
+      .text()
+  );
+  if (servingSizeText) {
+    nutrition.serving_size_text = servingSizeText;
+    const parsed = parseServingSize(servingSizeText);
+    nutrition.serving_size_value = parsed.value ?? 1;
+    nutrition.serving_size_unit_text = parsed.unit ?? "serving";
+  }
+
+  const caloriesText = normalizeWhitespace(
+    section.find(".nutrition-info_calories .calories-value").first().text()
+  );
+  if (caloriesText) {
+    const parsed = parseNutrientAmountWithQualifier(caloriesText);
+    if (parsed) {
+      nutrition.calories = parsed.value;
+      if (parsed.qualifier) nutrition.calories_qualifier = parsed.qualifier;
+    }
+  }
+
+  const readAmount = (valueSel: string, unitSel: string): string => {
+    const value = normalizeWhitespace(section.find(valueSel).first().text());
+    if (!value) return "";
+    const unit = normalizeWhitespace(section.find(unitSel).first().text());
+    return unit ? `${value} ${unit}` : value;
+  };
+
+  const readPct = (pctSel: string): string => {
+    return normalizeWhitespace(section.find(pctSel).first().text());
+  };
+
+  const assign = (label: string, valueSel: string, unitSel: string, pctSel?: string) => {
+    const amountText = readAmount(valueSel, unitSel);
+    if (amountText) {
+      const col = mapNutrientToColumn(label);
+      if (col) {
+        const parsed = parseNutrientAmountWithQualifier(amountText);
+        if (parsed) {
+          if ((nutrition as any)[col] == null) {
+            (nutrition as unknown as Record<string, number>)[col] = parsed.value;
+            if (parsed.qualifier) {
+              (nutrition as unknown as Record<string, string>)[`${col}_qualifier`] = parsed.qualifier;
+            }
+          }
+        }
+      }
+    }
+    if (pctSel) {
+      const dvText = readPct(pctSel);
+      if (dvText) {
+        const dvCol = mapNutrientToDvColumn(label);
+        if (dvCol) {
+          const dvMatch = dvText.match(/([\d.]+)/);
+          if (dvMatch) {
+            if ((nutrition as any)[dvCol] == null) {
+              (nutrition as unknown as Record<string, number>)[dvCol] = parseFloat(dvMatch[1]);
+            }
+          }
+        }
+        // If we have %DV but no amount, set amount to 0 to retain micronutrient presence
+        if (!amountText) {
+          const col = mapNutrientToColumn(label);
+          if (col && (nutrition as any)[col] == null) {
+            (nutrition as any)[col] = 0;
+          }
+        }
+      }
+    }
+  };
+
+  assign("Total Fat", ".fats-value", ".uom-fats-value", ".pct-fats-value");
+  assign("Saturated Fat", ".sfat-value", ".uom-sfat-value", ".pct-sfat-value");
+  assign("Trans Fat", ".tfat-value", ".uom-tfat-value", ".pct-tfat-value");
+  assign("Cholesterol", ".chol-value", ".uom-chol-value", ".pct-chol-value");
+  assign("Sodium", ".sodium-value", ".uom-sodium-value", ".pct-sodium-value");
+  assign("Total Carbohydrate", ".carb-value", ".uom-carb-value", ".pct-carb-value");
+  assign("Dietary Fiber", ".fibre-value", ".uom-fibre-value", ".pct-fibre-value");
+  assign("Total Sugars", ".sugar-value", ".uom-sugar-value");
+  assign("Added Sugars", ".add-sugar-value", ".uom-add-sugar-value", ".pct-add-sugar-value");
+  assign("Protein", ".protein-value", ".uom-protein-value", ".pct-protein-value");
+  assign("Vitamin D", ".vitaminD-value", ".uom-vitaminD-value", ".pct-vitaminD-value");
+  assign("Vitamin C", ".vitaminC-value", ".uom-vitaminC-value", ".pct-vitaminC-value");
+  assign("Vitamin B12", ".vitaminB12-value", ".uom-vitaminB12-value", ".pct-vitaminB12-value");
+  assign("Vitamin B6", ".vitaminB6-value", ".uom-vitaminB6-value", ".pct-vitaminB6-value");
+  assign("Calcium", ".calcium-value", ".uom-calcium-value", ".pct-calcium-value");
+  assign("Iron", ".iron-value", ".uom-iron-value", ".pct-iron-value");
+  assign("Potassium", ".potassium-value", ".uom-potassium-value", ".pct-potassium-value");
+
+  // Generic row-based fallback (handles PR markup variants like Vitamin C rows)
+  section.find("li.row").each((_, row) => {
+    const $row = $(row);
+    let label = normalizeWhitespace($row.find("span.col-xs-6").first().text());
+    if (!label) {
+      label = normalizeWhitespace($row.find("span.add-sugar").first().text());
+    }
+    if (!label) return;
+    const lower = label.toLowerCase();
+    if (lower.includes("amount/serving") || lower.includes("daily value") || lower === "calories") return;
+    if (lower.startsWith("includes") && lower.includes("added sugars")) label = "Added Sugars";
+    if (lower === "sugars") label = "Total Sugars";
+    if (lower === "carbohydrates") label = "Total Carbohydrate";
+
+    let amountText = normalizeWhitespace($row.find("span.col-xs-4").first().text());
+    if (!amountText && /added sugars/i.test(label)) {
+      const val = normalizeWhitespace($row.find(".add-sugar-value").first().text());
+      const unit = normalizeWhitespace($row.find(".uom-add-sugar-value").first().text());
+      if (val) amountText = unit ? `${val} ${unit}` : val;
+    }
+    const pctText =
+      normalizeWhitespace($row.find("span.col-xs-2").first().text()) ||
+      normalizeWhitespace($row.find("[class*='pct-']").first().text());
+
+    if (amountText) {
+      const col = mapNutrientToColumn(label);
+      if (col && (nutrition as any)[col] == null) {
+        const parsed = parseNutrientAmountWithQualifier(amountText);
+        if (parsed) {
+          (nutrition as any)[col] = parsed.value;
+          if (parsed.qualifier) (nutrition as any)[`${col}_qualifier`] = parsed.qualifier;
+        }
+      }
+    } else {
+      const col = mapNutrientToColumn(label);
+      if (col && pctText && (nutrition as any)[col] == null) {
+        (nutrition as any)[col] = 0;
+      }
+    }
+    if (pctText) {
+      const dvCol = mapNutrientToDvColumn(label);
+      if (dvCol && (nutrition as any)[dvCol] == null) {
+        const dvMatch = pctText.match(/([\d.]+)/);
+        if (dvMatch) (nutrition as any)[dvCol] = parseFloat(dvMatch[1]);
+      }
+    }
+  });
+
+  const hasNutrients = Object.keys(nutrition).some((k) =>
+    [
+      "calories",
+      "protein_g",
+      "total_carbs_g",
+      "fiber_g",
+      "sugars_g",
+      "added_sugars_g",
+      "total_fat_g",
+      "saturated_fat_g",
+      "trans_fat_g",
+      "cholesterol_mg",
+      "sodium_mg",
+      "potassium_mg",
+      "calcium_mg",
+      "iron_mg",
+      "vitamin_d_mcg",
+      "vitamin_c_mg",
+    ].includes(k)
+  );
+
+  return { nutrition: hasNutrients ? nutrition : null, servingSizeText: nutrition.serving_size_text ?? null };
+}
+
 function cleanAndOrText(text: string): { text: string; andOr: boolean } {
   const trimmed = text.trim();
   const andOrMatch = /^and\/?or\s+/i;
   if (andOrMatch.test(trimmed)) {
-    return {text: trimmed.replace(andOrMatch, "").trim(), andOr: true};
+    return { text: trimmed.replace(andOrMatch, "").trim(), andOr: true };
   }
-  return {text: trimmed, andOr: false};
+  return { text: trimmed, andOr: false };
 }
 
 function joinSubIngredients(items: string[], hasAndOr: boolean): string {
@@ -393,13 +603,45 @@ function extractIngredients($: cheerio.CheerioAPI): string | null {
   return null;
 }
 
+function extractAllergenStatement($: cheerio.CheerioAPI): string | null {
+  const list = $("#allergens-list");
+  if (!list.length) return null;
+  const contains = new Set<string>();
+  const mayContain = new Set<string>();
+  const shared = new Set<string>();
+  list.find("li").each((_, el) => {
+    const row = $(el);
+    const name =
+      normalizeWhitespace(row.find(".col-xs-8").first().text()) ||
+      normalizeWhitespace(row.text().replace(/May Contain|Contains|Shared Facility/gi, ""));
+    const badge = normalizeWhitespace(row.find(".badge").first().text());
+    if (!name || !badge) return;
+    if (/may\s*contain/i.test(badge)) mayContain.add(name.toLowerCase());
+    else if (/contains/i.test(badge)) contains.add(name.toLowerCase());
+    else if (/shared\s*facility/i.test(badge)) shared.add(name.toLowerCase());
+  });
+  const mayContainOnly = Array.from(mayContain).filter((item) => !contains.has(item));
+  if (!contains.size && !mayContainOnly.length && !shared.size) return null;
+  const parts: string[] = [];
+  if (contains.size) {
+    parts.push(`Contains ${Array.from(contains).join(", ")}.`);
+  }
+  if (mayContainOnly.length) {
+    parts.push(`May contain ${mayContainOnly.join(", ")}.`);
+  }
+  if (shared.size) {
+    parts.push(`Made in a shared facility that may use ${Array.from(shared).join(", ")}.`);
+  }
+  return parts.join(" ").trim();
+}
+
 function parseCocaColaNutrition(
   $: cheerio.CheerioAPI,
   productSizeText: string | null
 ): { nutrition: ScraperNutritionData | null; servingSizeText: string | null } {
   let section = $("#nutrition .nutrition-section");
   if (!section.length) section = $(".nutrition-section").first();
-  if (!section.length) return {nutrition: null, servingSizeText: null};
+  if (!section.length) return { nutrition: null, servingSizeText: null };
   const nutrition: ScraperNutritionData = {
     serving_size_value: 1,
     serving_size_unit_text: "serving",
@@ -497,7 +739,7 @@ function parseCocaColaNutrition(
       "vitamin_d_mcg",
     ].includes(k)
   );
-  return {nutrition: hasNutrients ? nutrition : null, servingSizeText: nutrition.serving_size_text ?? null};
+  return { nutrition: hasNutrients ? nutrition : null, servingSizeText: nutrition.serving_size_text ?? null };
 }
 
 function extractNutritionSection($: cheerio.CheerioAPI): cheerio.Cheerio<cheerio.Element> | null {
@@ -512,7 +754,7 @@ function extractNutritionSection($: cheerio.CheerioAPI): cheerio.Cheerio<cheerio
 
 function parseSmartLabelNutrition($: cheerio.CheerioAPI): { nutrition: ScraperNutritionData | null; servingSizeText: string | null } {
   const section = $(".nutrition-section").first();
-  if (!section.length) return {nutrition: null, servingSizeText: null};
+  if (!section.length) return { nutrition: null, servingSizeText: null };
 
   const nutrition: ScraperNutritionData = {
     serving_size_value: 1,
@@ -606,7 +848,7 @@ function parseSmartLabelNutrition($: cheerio.CheerioAPI): { nutrition: ScraperNu
       "folic_acid_mcg",
     ].includes(k)
   );
-  return {nutrition: hasNutrients ? nutrition : null, servingSizeText: nutrition.serving_size_text ?? null};
+  return { nutrition: hasNutrients ? nutrition : null, servingSizeText: nutrition.serving_size_text ?? null };
 }
 
 function extractNutritionFromTables($: cheerio.CheerioAPI, root: cheerio.Cheerio<cheerio.Element>): ScraperNutritionData | null {
@@ -734,7 +976,7 @@ function extractNutritionFromTables($: cheerio.CheerioAPI, root: cheerio.Cheerio
 
 function extractNutritionFromText(text: string): { nutrition: ScraperNutritionData | null; servingSizeText: string | null } {
   const lower = text.toLowerCase();
-  if (!/nutrition facts|serving size|calories/.test(lower)) return {nutrition: null, servingSizeText: null};
+  if (!/nutrition facts|serving size|calories/.test(lower)) return { nutrition: null, servingSizeText: null };
 
   const servingSize = text.match(/serving size\s*:?\\s*([^\n\r]+)/i)?.[1]?.trim() ?? null;
   const calories = text.match(/calories\s*:?\\s*(\d+)/i)?.[1] ?? null;
@@ -751,7 +993,7 @@ function extractNutritionFromText(text: string): { nutrition: ScraperNutritionDa
   }
   if (calories) nutrition.calories = parseInt(calories, 10);
 
-  return {nutrition, servingSizeText: servingSize};
+  return { nutrition, servingSizeText: servingSize };
 }
 
 function extractSmartLabelGuid(html: string): string | null {
@@ -844,29 +1086,21 @@ function extractBrand($: cheerio.CheerioAPI): string | null {
 }
 
 function deriveBrandAndName(name: string | null): { brand: string | null; name: string | null } {
-  if (!name) return {brand: null, name: null};
+  if (!name) return { brand: null, name: null };
   const parts = name.split(",").map((p) => p.trim()).filter(Boolean);
-  if (parts.length <= 1) return {brand: null, name};
+  if (parts.length <= 1) return { brand: null, name };
   const brand = parts[0];
   const rest = parts.slice(1);
   const reordered = rest.length >= 2 ? [rest[rest.length - 1], ...rest.slice(0, -1)] : rest;
-  return {brand, name: reordered.join(", ")};
+  return { brand, name: reordered.join(", ") };
 }
 
 function stripWeightFromName(name: string | null): string | null {
-  if (!name) return null;
-  let formatted = name.trim();
-  if (/\d/.test(formatted)) {
-    formatted = formatted.replace(
-      /\s*(,\s*)?(\d+(\.\d+)?\s*(fl\s*oz|fluid\s*ounce|fluid\s*ounces|oz|ounce|ounces|g|kg|mg|lb|lbs|pt|qt|l|ml))\b.*$/i,
-      ""
-    );
-    formatted = formatted.replace(/\s*\(([^)]*oz|[^)]*g|[^)]*ml|[^)]*lb)[^)]*\)\s*$/i, "");
-  }
-  formatted = formatted.replace(/\s*\([^)]*\)\s*$/g, "");
-  formatted = formatted.replace(/\s+/g, " ").trim();
-  formatted = formatted.replace(/^[,\s]+|[,\s]+$/g, "").trim();
-  return formatted;
+  return cleanProductName(name, {
+    stripTrailingWeight: true,
+    stripTrailingCommaSize: true,
+    stripParenAtEnd: true,
+  });
 }
 
 function removeBrandPrefix(name: string | null, brand: string | null): string | null {
@@ -903,18 +1137,30 @@ function extractImage($: cheerio.CheerioAPI, baseOrigin: string): string | null 
   const og = $("meta[property='og:image']").attr("content");
   if (og) {
     if (og.startsWith("http")) return og;
+    if (og.startsWith("./")) return `${baseOrigin}/${og.slice(2)}`;
     if (og.startsWith("/")) return `${baseOrigin}${og}`;
-    return og;
+    return `${baseOrigin}/${og}`;
   }
   const img = $("img").first().attr("src");
   if (!img) return null;
   if (img === "#") return null;
   if (img.startsWith("http")) return img;
+  if (img.startsWith("./")) return `${baseOrigin}/${img.slice(2)}`;
   if (img.startsWith("/")) return `${baseOrigin}${img}`;
-  return img;
+  return `${baseOrigin}/${img}`;
+}
+
+function normalizeImageUrl(value: string | null, baseOrigin: string): string | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (trimmed.startsWith("http")) return trimmed;
+  if (trimmed.startsWith("./")) return `${baseOrigin}/${trimmed.slice(2)}`;
+  if (trimmed.startsWith("/")) return `${baseOrigin}${trimmed}`;
+  return `${baseOrigin}/${trimmed}`;
 }
 
 async function fetchRenderedHtml(browser: Browser, url: string): Promise<string> {
+  const tryFetch = async (): Promise<string> => {
   const page = await browser.newPage({
     userAgent:
       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -945,6 +1191,12 @@ async function fetchRenderedHtml(browser: Browser, url: string): Promise<string>
         await tab.first().scrollIntoViewIfNeeded().catch(() => null);
         await tab.first().click({ timeout: 5000 }).catch(() => null);
       }
+    } else if (url.includes("#allergens")) {
+      const tab = page.locator("#section-allergens, .text-allergens, [data-section='allergens']");
+      if (await tab.count()) {
+        await tab.first().scrollIntoViewIfNeeded().catch(() => null);
+        await tab.first().click({ timeout: 5000 }).catch(() => null);
+      }
     }
     if (url.includes("#nutrition")) {
       await page
@@ -970,7 +1222,7 @@ async function fetchRenderedHtml(browser: Browser, url: string): Promise<string>
     }
     await page
       .waitForSelector(
-        "#nutrition, #ingredients, [id*='nutrition'], [id*='ingredient'], table",
+        "#nutrition, #ingredients, #allergens, #allergens-list, [id*='nutrition'], [id*='ingredient'], [id*='allergen'], table",
         { timeout: 5000 }
       )
       .catch(() => {});
@@ -978,6 +1230,22 @@ async function fetchRenderedHtml(browser: Browser, url: string): Promise<string>
     return html;
   } finally {
     await page.close().catch(() => null);
+  }
+  };
+  try {
+    return await tryFetch();
+  } catch (err) {
+    if (DEBUG_SMART_LABEL) {
+      console.error(`[DEBUG] render failed for ${url}, retrying once...`, err);
+    }
+    try {
+      return await tryFetch();
+    } catch (err2) {
+      if (DEBUG_SMART_LABEL) {
+        console.error(`[DEBUG] render failed for ${url} after retry:`, err2);
+      }
+      return "";
+    }
   }
 }
 
@@ -1011,20 +1279,19 @@ async function discoverProductUrls(
               const brand = (tds[0].textContent || "").trim();
               const link = tds[1].querySelector("a");
               const url = (link as HTMLAnchorElement | null)?.href?.trim() || "";
-              const name = ((link as HTMLAnchorElement | null)?.textContent || tds[1].textContent || "").trim();
-              return { url, brand, name };
+              return { url, brand };
             })
             .filter(Boolean)
         );
         const beforeCount = collected.length;
-        for (const row of rows as Array<{ url: string; brand: string; name: string }>) {
-          if (!row.url) continue;
-          if (seen.has(row.url)) continue;
-          seen.add(row.url);
+      for (const row of rows as Array<{ url: string; brand: string }>) {
+        if (!row.url) continue;
+        if (!isAllowedCocaColaUrl(row.url)) continue;
+        if (seen.has(row.url)) continue;
+        seen.add(row.url);
           collected.push({
             url: row.url.split("#")[0],
             brand: row.brand || undefined,
-            name: row.name || undefined,
           });
           if (maxUrls && collected.length >= maxUrls) return collected;
         }
@@ -1040,10 +1307,36 @@ async function discoverProductUrls(
 
     await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await page.waitForTimeout(1500);
-    const collected = new Set<string>();
+    const collected = new Map<string, { url: string; brand?: string; name?: string }>();
     let pageIndex = 0;
     while (true) {
       pageIndex += 1;
+      const tableRows = await page.$$eval("table tr", (trs) =>
+        trs
+          .map((tr) => {
+            const tds = tr.querySelectorAll("td");
+            if (tds.length < 2) return null;
+            const brand = (tds[0].textContent || "").trim();
+            const link = tds[1].querySelector("a");
+            const url = (link as HTMLAnchorElement | null)?.href?.trim() || "";
+            return { url, brand };
+          })
+          .filter(Boolean)
+      );
+      for (const row of tableRows as Array<{ url: string; brand: string }>) {
+        if (!row.url) continue;
+        if (!isAllowedCocaColaUrl(row.url)) continue;
+        const normalizedUrl = row.url.split("#")[0];
+        if (!collected.has(normalizedUrl)) {
+          collected.set(normalizedUrl, {
+            url: normalizedUrl,
+            brand: row.brand || undefined,
+          });
+          if (maxUrls && collected.size >= maxUrls) {
+            return Array.from(collected.values());
+          }
+        }
+      }
       const hrefs = await page.$$eval("a[href]", (links) =>
         links
           .map((a) => (a as HTMLAnchorElement).href)
@@ -1051,9 +1344,13 @@ async function discoverProductUrls(
       );
       for (const href of hrefs) {
         if (!href) continue;
-        collected.add(href.split("#")[0].replace(/\?.*$/, ""));
+        if (!isAllowedCocaColaUrl(href)) continue;
+        const normalizedUrl = href.split("#")[0];
+        if (!collected.has(normalizedUrl)) {
+          collected.set(normalizedUrl, { url: normalizedUrl });
+        }
         if (maxUrls && collected.size >= maxUrls) {
-          return Array.from(collected).map((u) => ({ url: u }));
+          return Array.from(collected.values());
         }
       }
       if (DEBUG_SMART_LABEL) {
@@ -1193,11 +1490,18 @@ async function fetchProduct(
   let ingredientsSource: string | null = null;
   let ingredientsText = extractIngredients($);
   if (ingredientsText) ingredientsSource = "smartlabel-dom";
+  let allergenStatement = extractAllergenStatement($);
   const baseOrigin = new URL(url).origin;
   let imageUrl: string | null = extractImage($, baseOrigin);
 
   const upcFromQuery = urlObj.searchParams.get("upc");
   let upcFromText = upcFromQuery || extractUpc(html) || extractUpc($("body").text());
+
+  const exists = await checkProductExists({ name, brand, upc: upcFromText });
+  if (exists) {
+    console.log(`[SKIP] ${brand} ${name ?? "(no name)"}: already exists`);
+    return null;
+  }
   const nutritionSection = extractNutritionSection($);
   let nutrition: ScraperNutritionData | null = null;
   let servingSizeText: string | null = null;
@@ -1205,24 +1509,52 @@ async function fetchProduct(
     nutrition = extractNutritionFromTables($, nutritionSection);
     if (nutrition?.serving_size_text) servingSizeText = nutrition.serving_size_text;
   }
+  const isCocaPr = /smartlabelpr\.coca-colaproductfacts\.com/i.test(urlObj.host);
+  if (!nutrition || isCocaPr) {
+    const prParsed = parseCocaPrNutrition($);
+    if (prParsed.nutrition) {
+      if (!nutrition) {
+        nutrition = prParsed.nutrition;
+      } else {
+        for (const [key, value] of Object.entries(prParsed.nutrition)) {
+          const existing = (nutrition as any)[key];
+          if (existing === undefined || existing === null || existing === "") {
+            (nutrition as any)[key] = value as any;
+          }
+        }
+      }
+    }
+    servingSizeText = prParsed.servingSizeText ?? servingSizeText;
+    if (DEBUG_SMART_LABEL && prParsed.nutrition) {
+      const n = prParsed.nutrition as any;
+      console.log(
+        `[DEBUG] pr vitamin c: ${n.vitamin_c_mg ?? "(null)"} mg, dv ${n.vitamin_c_dv_pct ?? "(null)"}`
+      );
+    }
+  }
   if (!nutrition) {
     const fallback = extractNutritionFromText($("body").text());
     nutrition = fallback.nutrition;
     servingSizeText = fallback.servingSizeText;
   }
 
+  const isCocaCola = /coca-colaproductfacts\.com/i.test(urlObj.host);
   let nutritionUrl = url.includes("#") ? url : `${url}#nutrition`;
   let ingredientsUrl = url.includes("#") ? url : `${url}#ingredients`;
   if (nutritionUrl.includes("/nutrition/")) {
     ingredientsUrl = ingredientsUrl.replace("/nutrition/", "/ingredients/");
   }
 
-  const isCocaCola = /coca-colaproductfacts\.com/i.test(urlObj.host);
-  const renderedNutrition = (!nutrition || DEBUG_SMART_LABEL)
+  const renderedNutrition = (isCocaCola || isCocaPr || !nutrition || DEBUG_SMART_LABEL)
     ? await fetchRenderedHtml(browser, nutritionUrl)
     : null;
   if (renderedNutrition && DEBUG_SMART_LABEL) {
     await fs.writeFile("/tmp/smart-label-rendered-nutrition.html", renderedNutrition).catch(() => null);
+  }
+  if (renderedNutrition && DEBUG_SMART_LABEL && isCocaPr) {
+    await fs
+      .writeFile("/tmp/smart-labelpr-rendered-nutrition.html", renderedNutrition)
+      .catch(() => null);
   }
   if (renderedNutrition) {
     const $r = cheerio.load(renderedNutrition);
@@ -1245,7 +1577,7 @@ async function fetchProduct(
       const extracted = extractUpc(cocaUpc);
       if (extracted) upcFromText = extracted;
     }
-    if (cocaImage) imageUrl = cocaImage;
+    if (cocaImage) imageUrl = normalizeImageUrl(cocaImage, baseOrigin);
     if (!name) {
       const header = extractHeaderName($r) || extractName($r);
       if (header) name = stripWeightFromName(header);
@@ -1268,6 +1600,31 @@ async function fetchProduct(
       const parsedNutrition = parseSmartLabelNutrition($r);
       nutrition = parsedNutrition.nutrition;
       servingSizeText = parsedNutrition.servingSizeText ?? servingSizeText;
+    }
+    if (isCocaPr) {
+      const prRendered = parseCocaPrNutrition($r);
+      if (prRendered.nutrition) {
+        if (!nutrition) {
+          nutrition = prRendered.nutrition;
+        } else {
+          for (const [key, value] of Object.entries(prRendered.nutrition)) {
+            const existing = (nutrition as any)[key];
+            if (existing === undefined || existing === null || existing === "") {
+              (nutrition as any)[key] = value as any;
+            }
+          }
+        }
+      }
+      servingSizeText = prRendered.servingSizeText ?? servingSizeText;
+      if (DEBUG_SMART_LABEL) {
+        const n = prRendered.nutrition as any;
+        console.log(
+          `[DEBUG] pr(rendered) vitamin c: ${n?.vitamin_c_mg ?? "(null)"} mg, dv ${n?.vitamin_c_dv_pct ?? "(null)"}`
+        );
+      }
+    }
+    if (!allergenStatement) {
+      allergenStatement = extractAllergenStatement($r);
     }
     if (!nutrition) {
       const section = extractNutritionSection($r);
@@ -1294,6 +1651,16 @@ async function fetchProduct(
       if (ingredientsText) ingredientsSource = "smartlabel-rendered";
       if (!imageUrl) imageUrl = extractImage($r, baseOrigin);
     }
+  }
+
+  if (!allergenStatement) {
+    const allergensUrl = url.includes("#") ? url : `${url}#allergens`;
+    const renderedAllergens = await fetchRenderedHtml(browser, allergensUrl);
+    if (DEBUG_SMART_LABEL) {
+      await fs.writeFile("/tmp/smart-label-rendered-allergens.html", renderedAllergens).catch(() => null);
+    }
+    const $a = cheerio.load(renderedAllergens);
+    allergenStatement = extractAllergenStatement($a);
   }
   if (DEBUG_SMART_LABEL) {
     console.log(`[DEBUG] ingredients source: ${ingredientsSource ?? "(null)"}`);
@@ -1337,6 +1704,7 @@ async function fetchProduct(
     console.log(`[DEBUG] brand: ${brand ?? "(null)"}`);
     console.log(`[DEBUG] upc12: ${upcFromText ?? "(null)"}`);
     console.log(`[DEBUG] ingredients length: ${ingredientsText?.length ?? 0}`);
+    console.log(`[DEBUG] allergens: ${allergenStatement ?? "(null)"}`);
     console.log(`[DEBUG] image: ${imageUrl ?? "(null)"}`);
   if (nutrition) {
       console.log(`[DEBUG] nutrition serving size: ${nutrition.serving_size_text ?? "(null)"}`);
@@ -1353,12 +1721,14 @@ async function fetchProduct(
   const status = ingredientsText && nutrition ? "OK" : "SKIP";
   console.log(`[PRODUCT] ${status} | ${name ?? "(no name)"} | ${url}`);
 
+  imageUrl = normalizeImageUrl(imageUrl, baseOrigin);
   return {
     productUrl: url,
     name,
     brand,
     upc12: upcFromText,
     ingredientsText,
+    allergenStatement,
     imageUrl,
     nutrition,
     servingSizeText,
@@ -1374,7 +1744,8 @@ function transformToOutput(p: ScrapedProduct, jobId: string): ScraperProductOutp
     upc: p.upc12 || undefined,
     upcs: p.upcs && p.upcs.length ? p.upcs : p.upc12 ? [p.upc12] : undefined,
     ingredients_text: p.ingredientsText || "",
-    source: "smart_label",
+    allergen_statement: p.allergenStatement || undefined,
+    source: SCRAPER_NAME,
     source_id: p.productUrl,
     source_created_at: p.sourceCreatedAt || now,
     source_last_updated_at: p.sourceLastUpdatedAt || now,
@@ -1391,6 +1762,17 @@ function normalizeMergeText(value: string | null | undefined): string {
   return value.replace(/\s+/g, " ").trim().toLowerCase();
 }
 
+function isHttpsUrl(value: string | null | undefined): boolean {
+  if (!value) return false;
+  return /^https?:\/\//i.test(value);
+}
+
+function mergeImageUrl(existing: string | null, candidate: string | null): string | null {
+  if (isHttpsUrl(existing)) return existing;
+  if (isHttpsUrl(candidate)) return candidate;
+  return existing || candidate;
+}
+
 function nutritionSignature(nutrition: ScraperNutritionData | null | undefined): string {
   if (!nutrition) return "";
   const entries = Object.entries(nutrition)
@@ -1399,21 +1781,26 @@ function nutritionSignature(nutrition: ScraperNutritionData | null | undefined):
   return JSON.stringify(entries);
 }
 
+function buildMergeKey(product: ScrapedProduct): string {
+  return [
+    normalizeMergeText(product.brand),
+    normalizeMergeText(product.name),
+    normalizeMergeText(product.ingredientsText),
+    nutritionSignature(product.nutrition),
+    normalizeMergeText(product.servingSizeText),
+  ].join("||");
+}
+
 function mergeProducts(products: ScrapedProduct[]): ScrapedProduct[] {
   const merged = new Map<string, ScrapedProduct>();
   for (const product of products) {
-    const key = [
-      normalizeMergeText(product.brand),
-      normalizeMergeText(product.name),
-      normalizeMergeText(product.ingredientsText),
-      nutritionSignature(product.nutrition),
-      normalizeMergeText(product.servingSizeText),
-    ].join("||");
+    const key = buildMergeKey(product);
     const existing = merged.get(key);
     if (!existing) {
       merged.set(key, { ...product, upcs: product.upc12 ? [product.upc12] : [] });
       continue;
     }
+    existing.imageUrl = mergeImageUrl(existing.imageUrl, product.imageUrl);
     const upcs = new Set([...(existing.upcs || []), ...(existing.upc12 ? [existing.upc12] : [])]);
     if (product.upc12) upcs.add(product.upc12);
     const sorted = Array.from(upcs).sort();
@@ -1488,17 +1875,27 @@ function parseArgs() {
   const defaultConfig = path.resolve(__dirname, "./config.json");
   let configPath = defaultConfig;
   let url: string | undefined;
+  let searchUrl: string | undefined;
   let limit: number | undefined;
   let offset: number | undefined;
   let local = false;
   let debug = false;
+  let noHeadless = false;
+  let headless = false;
   let reorderName = false;
+  let concurrency = 5;
 
   for (let i = 0; i < argv.length; i++) {
     if ((argv[i] === "--url" || argv[i] === "-u") && argv[i + 1]) {
       url = argv[i + 1];
       i++;
+    } else if ((argv[i] === "--search" || argv[i] === "-s") && argv[i + 1]) {
+      searchUrl = argv[i + 1];
+      i++;
     } else if (argv[i] === "--config" && argv[i + 1]) {
+      configPath = path.resolve(argv[i + 1]);
+      i++;
+    } else if (argv[i] === "--config" || argv[i] === "-c") {
       configPath = path.resolve(argv[i + 1]);
       i++;
     } else if ((argv[i] === "--limit" || argv[i] === "-l") && argv[i + 1]) {
@@ -1513,18 +1910,29 @@ function parseArgs() {
       local = true;
     } else if ((argv[i] === "--debug" || argv[i] === "-d")) {
       debug = true;
+    } else if (argv[i] === "--no-headless") {
+      noHeadless = true;
+    } else if (argv[i] === "--headless") {
+      headless = true;
     } else if (argv[i] === "--reorder-name") {
       reorderName = true;
+    } else if ((argv[i] === "--concurrency" || argv[i] === "-n") && argv[i + 1]) {
+      const n = parseInt(argv[i + 1], 10);
+      if (!isNaN(n) && n > 0) concurrency = n;
+      i++;
     }
   }
 
-  return { url, configPath, limit, offset, local, reorderName, debug };
+  return { url, searchUrl, configPath, limit, offset, local, reorderName, debug, noHeadless, headless, concurrency };
 }
 
 async function main(): Promise<void> {
-  const { url, configPath, limit, offset, local, reorderName, debug } = parseArgs();
+  const { url, searchUrl, configPath, limit, offset, local, reorderName, debug, noHeadless, headless, concurrency } = parseArgs();
+  let effectiveSearchUrl = searchUrl;
 
   DEBUG_SMART_LABEL = debug;
+  if (noHeadless) SMART_LABEL_HEADLESS = false;
+  if (headless) SMART_LABEL_HEADLESS = true;
 
   if (local) {
     console.log("Running in local mode: skipping DynamoDB and S3; API submission still runs.");
@@ -1565,6 +1973,10 @@ async function main(): Promise<void> {
     try {
       const raw = await fs.readFile(configPath, "utf-8");
       const cfg = JSON.parse(raw) as AppConfig;
+      if (DEBUG_SMART_LABEL) {
+        console.log(`[DEBUG] loaded config: ${configPath}`);
+        console.log(`[DEBUG] config urls: ${cfg.urls?.length ?? 0}, searchUrls: ${cfg.searchUrls?.length ?? 0}`);
+      }
       urls = (cfg.urls || []).filter((u) => typeof u === "string" || typeof u === "object");
       const configReorder = cfg.reorderName === true;
       effectiveReorder = reorderName || configReorder;
@@ -1572,40 +1984,69 @@ async function main(): Promise<void> {
         console.log("Reorder name: enabled via config");
       }
       const searchUrls = (cfg.searchUrls || []).filter((u) => typeof u === "string" || typeof u === "object");
-      for (const searchUrl of searchUrls) {
+      if (!effectiveSearchUrl && searchUrls.length) {
         const entry =
-          typeof searchUrl === "string"
-            ? { url: searchUrl, stripWeight: true }
-            : searchUrl;
-        if (!entry?.url) continue;
-        if (Number.isFinite(desiredCount) && urls.length >= desiredCount) break;
-        const remaining = Number.isFinite(desiredCount) ? Math.max(desiredCount - urls.length, 0) : undefined;
-        console.log(`[DISCOVER] SmartLabel catalog: ${entry.url}`);
-        try {
-          const discovered = await discoverProductUrls(browser, entry.url, remaining);
-          console.log(`[DISCOVER] Found ${discovered.length} product URLs`);
-          for (const d of discovered) {
-            const item = typeof d === "string" ? { url: d } : d;
-            urls.push({
-              url: item.url,
-              stripWeight: entry.stripWeight !== false,
-              reorderName: typeof entry.reorderName === "boolean" ? entry.reorderName : undefined,
-              brand: (item as any).brand,
-              name: (item as any).name,
-            });
+          typeof searchUrls[0] === "string"
+            ? { url: searchUrls[0], stripWeight: true }
+            : searchUrls[0];
+        effectiveSearchUrl = entry?.url;
+      }
+      if (searchUrls.length) {
+        for (const s of searchUrls) {
+          if (Number.isFinite(desiredCount) && urls.length >= desiredCount) break;
+          const entry =
+            typeof s === "string"
+              ? { url: s, stripWeight: true }
+              : s;
+          if (!entry?.url) continue;
+          const remaining = Number.isFinite(desiredCount) ? Math.max(desiredCount - urls.length, 0) : undefined;
+          console.log(`[DISCOVER] SmartLabel catalog: ${entry.url}`);
+          try {
+            const discovered = await discoverProductUrls(browser, entry.url, remaining);
+            console.log(`[DISCOVER] Found ${discovered.length} product URLs`);
+            for (const d of discovered) {
+              const item = typeof d === "string" ? { url: d } : d;
+              urls.push({
+                url: item.url,
+                stripWeight: entry.stripWeight !== false,
+                reorderName: typeof entry.reorderName === "boolean" ? entry.reorderName : undefined,
+                brand: (item as any).brand,
+              });
+            }
+          } catch (err) {
+            console.error(`[DISCOVER] Failed ${entry.url}:`, err);
           }
-        } catch (err) {
-          console.error(`[DISCOVER] Failed ${entry.url}:`, err);
         }
       }
-    } catch {
-      // ignore
+    } catch (err) {
+      if (DEBUG_SMART_LABEL) {
+        console.error(`[DEBUG] failed to read config: ${configPath}`, err);
+      }
+    }
+  }
+
+  if (effectiveSearchUrl) {
+    try {
+      const remaining = Number.isFinite(desiredCount) ? Math.max(desiredCount - urls.length, 0) : undefined;
+      console.log(`[DISCOVER] SmartLabel catalog: ${effectiveSearchUrl}`);
+      const discovered = await discoverProductUrls(browser, effectiveSearchUrl, remaining);
+      console.log(`[DISCOVER] Found ${discovered.length} product URLs`);
+      for (const d of discovered) {
+        const item = typeof d === "string" ? { url: d } : d;
+          urls.push({
+            url: item.url,
+            stripWeight: true,
+            brand: (item as any).brand,
+          });
+        }
+    } catch (err) {
+      console.error(`[DISCOVER] Failed ${effectiveSearchUrl}:`, err);
     }
   }
 
   const deduped = new Map<
     string,
-    { url: string; stripWeight: boolean; reorderName?: boolean; brand?: string; name?: string }
+    { url: string; stripWeight: boolean; reorderName?: boolean; brand?: string }
   >();
   for (const u of urls) {
     if (typeof u === "string") {
@@ -1617,7 +2058,6 @@ async function main(): Promise<void> {
           stripWeight: u.stripWeight !== false,
           reorderName: typeof u.reorderName === "boolean" ? u.reorderName : undefined,
           brand: u.brand,
-          name: u.name,
         });
       }
     }
@@ -1631,13 +2071,16 @@ async function main(): Promise<void> {
   }
 
   const results: ScraperProductOutput[] = [];
+  let success = 0;
+  let fail = 0;
+
   if (effectiveReorder) {
     console.log("Reorder name: enabled");
   }
   const valid: ScrapedProduct[] = [];
-  const concurrency = 5;
+  const workerCount = Math.max(1, concurrency || 5);
   const queue = [...targets];
-  const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
+  const workers = Array.from({ length: Math.min(workerCount, queue.length) }, async () => {
     while (queue.length) {
       const u = queue.shift();
       if (!u) break;
@@ -1645,7 +2088,6 @@ async function main(): Promise<void> {
       const reorder = typeof target.reorderName === "boolean" ? target.reorderName : effectiveReorder;
       const product = await fetchProduct(browser, target.url, reorder, target.stripWeight, {
         brand: (target as any).brand,
-        name: (target as any).name,
       });
       if (!product) continue;
       if (!product.name || !product.ingredientsText || !product.upc12) continue;
@@ -1668,14 +2110,15 @@ async function main(): Promise<void> {
     await uploadToS3(results, jobId, runDateTime);
   }
 
-  console.log(`\n📤 Submitting ${results.length} products for review...`);
-  let success = 0;
-  let fail = 0;
-  for (const r of results) {
-    const { scraper_job_id: _, ...body } = r;
-    const ok = await submitProductForReview(body);
-    if (ok) success++;
-    else fail++;
+  console.log(`\n📤 Submitting ${results.length} merged products for review...`);
+  for (let i = 0; i < results.length; i += 10) {
+    const batch = results.slice(i, i + 10);
+    console.log(`\n➡️  Submitting batch (${batch.length} items)`);
+    const outcomes = await Promise.all(batch.map((r) => submitProductForReview(r)));
+    for (const ok of outcomes) {
+      if (ok) success++;
+      else fail++;
+    }
   }
   console.log(`\n📊 API: ${success} submitted, ${fail} failed`);
 
