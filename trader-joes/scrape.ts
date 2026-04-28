@@ -1146,6 +1146,10 @@ async function main(): Promise<void> {
         }
         continue;
       }
+      if (combineIngredients(product.ingredients || []).toLowerCase().includes('please review packaging in-store for current details')) {
+        console.log(`[SKIP] ${product.item_title}: ingredients text contains placeholder`);
+        continue;
+      }
       const output = transformToScraperOutput(product);
       const exists = await checkProductExists({
         name: output.product_name || null,
